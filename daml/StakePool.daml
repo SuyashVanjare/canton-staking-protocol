@@ -1,0 +1,171 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+module StakePool where
+
+import DA.Date (Date, addDays, date)
+import DA.Time (Time, getTime)
+import DA.Assert ((===))
+import DA.Next.Map (Map)
+import DA.Next.Set (Set)
+import qualified DA.Next.Map as Map
+import qualified DA.Next.Set as Set
+
+-- | Represents a record of a slashing event against the pool.
+data SlashingCondition = SlashingCondition
+  with
+    reason : Text
+    percentage : Decimal
+    slashedAt : Time
+  deriving (Eq, Show)
+
+-- | Represents a request from a delegator to unbond their stake.
+-- This contract enforces the time-lock (cooldown period) before tokens can be withdrawn.
+template UnbondingRequest
+  with
+    operator : Party
+    delegator : Party
+    amount : Decimal
+    stakedToken : Text
+    releaseDate : Date -- The date when the funds can be withdrawn.
+  where
+    signatory operator, delegator
+
+    -- | Choice for the delegator to withdraw their unbonded stake after the
+    -- cooldown period has passed.
+    choice Withdraw : ()
+      controller delegator
+      do
+        now <- getTime
+        let today = date (DA.Date.year now) (DA.Date.month now) (DA.Date.day now)
+        assertMsg "Unbonding period has not elapsed yet" (today >= releaseDate)
+        -- In a production system, this choice would trigger a corresponding
+        -- transaction on a token ledger to transfer the `amount` of `stakedToken`
+        -- from the pool's account back to the delegator.
+        -- For this example, archiving the request signifies a successful withdrawal.
+        pure ()
+
+-- | The main template for a validator's staking pool.
+-- It tracks total stake, individual delegations, and manages the lifecycle
+-- of staking, unbonding, and slashing.
+template StakePool
+  with
+    operator : Party
+    poolId : Text
+    stakedToken : Text
+    totalStaked : Decimal
+    delegations : Map Party Decimal
+    commissionRate : Decimal
+    minDelegation : Decimal
+    unbondingPeriodDays : Int
+    slashingHistory : [SlashingCondition]
+  where
+    signatory operator
+    observer Set.fromMap (Map.keysSet delegations)
+
+    key (operator, poolId) : (Party, Text)
+    maintainer key._1
+
+    ensure
+      commissionRate >= 0.0 && commissionRate <= 1.0
+      && totalStaked >= 0.0
+      && minDelegation > 0.0
+      && let calculatedTotal = Map.foldl (+) 0.0 delegations
+         in totalStaked === calculatedTotal
+
+    -- | Allows a delegator to add stake to the pool.
+    -- If the delegator already has a stake, this will increase it.
+    choice Delegate : ContractId StakePool
+      with
+        delegator : Party
+        amount : Decimal
+      controller delegator
+      do
+        assertMsg "Delegation amount must be positive" (amount > 0.0)
+
+        -- Check if the new delegation meets the minimum threshold.
+        -- If the delegator already has a stake, this check is on the new amount,
+        -- not their total, to prevent small, spammy top-ups.
+        assertMsg ("Delegation must be at least " <> show minDelegation) (amount >= minDelegation)
+
+        -- In a real system, this step would be preceded by exercising a choice on
+        -- a fungible token contract to lock the user's tokens into the pool's account.
+
+        let newDelegations = Map.insertWith (+) delegator amount delegations
+        let newTotalStaked = totalStaked + amount
+
+        create this with
+          delegations = newDelegations,
+          totalStaked = newTotalStaked
+
+    -- | Initiates the unbonding process for a portion of a delegator's stake.
+    -- This removes the stake from the active pool and creates an `UnbondingRequest`
+    -- contract, which enforces a time lock.
+    choice RequestUnbond : ContractId UnbondingRequest
+      with
+        delegator : Party
+        amount : Decimal
+      controller delegator
+      do
+        -- Ensure the delegator exists and has enough stake.
+        currentStake <- assertSomeMsg "Delegator not found in this pool" $ Map.lookup delegator delegations
+        assertMsg "Unbond amount must be positive" (amount > 0.0)
+        assertMsg "Unbond amount cannot exceed current stake" (amount <= currentStake)
+
+        -- Remove the unbonding amount from the active stake pool.
+        let remainingStake = currentStake - amount
+        let newDelegations =
+              if remainingStake > 0.0 then
+                Map.insert delegator remainingStake delegations
+              else
+                Map.delete delegator delegations
+        let newTotalStaked = totalStaked - amount
+
+        archive self
+        create this with
+          delegations = newDelegations,
+          totalStaked = newTotalStaked
+
+        -- Create the time-locked unbonding request.
+        now <- getTime
+        let today = date (DA.Date.year now) (DA.Date.month now) (DA.Date.day now)
+        let releaseDate = addDays today unbondingPeriodDays
+
+        create UnbondingRequest with operator, delegator, amount, stakedToken, releaseDate
+
+    -- | Operator-only choice to slash the entire pool for a protocol violation.
+    -- This reduces the stake of all delegators proportionally.
+    choice Slash : ContractId StakePool
+      with
+        reason : Text
+        slashPercentage : Decimal
+      controller operator
+      do
+        assertMsg "Slash percentage must be between 0.0 and 1.0"
+          (slashPercentage > 0.0 && slashPercentage <= 1.0)
+
+        now <- getTime
+        let slashEvent = SlashingCondition with reason, percentage = slashPercentage, slashedAt = now
+
+        let slashMultiplier = 1.0 - slashPercentage
+        let newDelegations = Map.map (* slashMultiplier) delegations
+        let newTotalStaked = totalStaked * slashMultiplier
+
+        create this with
+          delegations = newDelegations,
+          totalStaked = newTotalStaked,
+          slashingHistory = slashEvent :: slashingHistory
+
+    -- | Allows the operator to update the commission rate for the pool.
+    -- This rate affects future reward distributions.
+    choice UpdateCommission : ContractId StakePool
+      with
+        newRate : Decimal
+      controller operator
+      do
+        assertMsg "New commission rate must be between 0.0 and 1.0"
+          (newRate >= 0.0 && newRate <= 1.0)
+        -- In a production system, you might enforce a maximum rate change per day
+        -- to protect delegators from sudden, drastic increases.
+        create this with commissionRate = newRate
