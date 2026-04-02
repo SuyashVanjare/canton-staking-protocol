@@ -1,0 +1,162 @@
+-- |
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module RewardAccrual where
+
+import DA.Time (Time, RelTime, addRelTime, fromRelTime)
+import DA.Numeric (Numeric, intToNumeric)
+import DA.Assert (assert, assertMsg)
+import DA.Optional (Optional(..))
+import DA.Foldable (forA_)
+import Control.Applicative (when)
+
+-- These imports are assumed to exist from other files in the project.
+import StakePool (StakePool)
+import Delegation (Delegation(..))
+
+-- | Defines the reward parameters and distribution schedule for a stake pool.
+-- This contract is managed by the validator and serves as the engine for
+-- reward calculations for a specific pool.
+template RewardSchedule
+  with
+    validator : Party
+    stakePoolCid : ContractId StakePool
+    -- | Annual Percentage Rate (APR) expressed as a decimal (e.g., 0.05 for 5%).
+    annualPercentageRate : Numeric 10
+    -- | The duration of a single reward epoch.
+    epochDuration : RelTime
+    -- | The number of the last epoch for which rewards were successfully distributed.
+    lastProcessedEpochNumber : Int
+    -- | The timestamp marking the end of the last processed epoch. This is the
+    -- | start time for the next epoch.
+    lastProcessedTime : Time
+  where
+    signatory validator
+
+    key (validator, stakePoolCid) : (Party, ContractId StakePool)
+    maintainer key._1
+
+    -- | Helper to calculate the total rewards for a single epoch based on the total
+    -- amount staked in the pool.
+    let calculateEpochReward (totalStaked : Numeric 10) : Numeric 10 =
+          -- Formula: (TotalStaked * APR) * (EpochDurationInSeconds / SecondsInYear)
+          let secondsInYear = 31536000.0 -- 365 * 24 * 60 * 60
+          let epochDurationInSeconds = intToNumeric $ truncate $ fromRelTime epochDuration
+          let annualInterest = totalStaked * annualPercentageRate
+          annualInterest * epochDurationInSeconds / secondsInYear
+
+    -- | Allows the validator to update the reward rate for future epochs.
+    choice UpdateRate : ContractId RewardSchedule
+      with
+        newApr : Numeric 10
+      controller validator
+      do
+        assertMsg "New APR must be non-negative" (newApr >= 0.0)
+        create this with annualPercentageRate = newApr
+
+    -- | Processes rewards for the next epoch. This choice is intended to be
+    -- | called by an automated process (e.g., a Daml Trigger or Canton Domain Service)
+    -- | after an epoch has concluded. It calculates the total rewards for the epoch and
+    -- | distributes them proportionally to all active delegations.
+    choice DistributeNextEpochRewards : ContractId RewardSchedule
+      with
+        -- | A list of all active delegations for this pool. This is passed in
+        -- | to avoid an unbounded fetch within the transaction, which is a Daml best practice.
+        delegationCids : [ContractId Delegation]
+        currentTime : Time
+      controller validator
+      do
+        let nextEpochNumber = lastProcessedEpochNumber + 1
+        let nextEpochStartTime = lastProcessedTime
+        let nextEpochEndTime = addRelTime nextEpochStartTime epochDuration
+
+        -- Ensure we are processing the epoch only after it has completed.
+        assertMsg "Cannot distribute rewards before epoch ends" (currentTime >= nextEpochEndTime)
+
+        pool <- fetch stakePoolCid
+        assertMsg "Stake pool contract's validator does not match this schedule's validator" (pool.validator == validator)
+
+        -- Only distribute rewards if there is stake in the pool.
+        when (pool.totalStaked > 0.0) do
+          -- Calculate total rewards for this epoch
+          let totalEpochRewards = calculateEpochReward pool.totalStaked
+
+          -- Distribute rewards proportionally to each delegation
+          forA_ delegationCids (\delegationCid -> do
+            delegation <- fetch delegationCid
+            -- Ensure the delegation belongs to this validator (and thus this pool)
+            assert (delegation.validator == validator)
+
+            let delegatorShare = delegation.stakedAmount / pool.totalStaked
+            let rewardAmount = totalEpochRewards * delegatorShare
+
+            -- If there's a non-zero reward, find or create the AccruedRewards contract
+            -- and add the reward.
+            when (rewardAmount > 0.0) do
+              mRewardCid <- lookupByKey @AccruedRewards (delegation.delegator, delegationCid)
+              case mRewardCid of
+                Some rewardCid ->
+                  exercise rewardCid AddReward with newRewardAmount = rewardAmount
+                None ->
+                  create AccruedRewards with
+                    delegator = delegation.delegator
+                    validator
+                    delegationCid
+                    accruedAmount = rewardAmount
+            )
+
+        -- Create the next version of the schedule, marking this epoch as processed.
+        create this with
+          lastProcessedEpochNumber = nextEpochNumber
+          lastProcessedTime = nextEpochEndTime
+
+
+-- | Tracks the rewards accrued by a single delegator for a specific delegation contract.
+-- This allows rewards to be managed separately from the core stake and enables
+-- features like compounding or separate claiming.
+template AccruedRewards
+  with
+    delegator : Party
+    validator : Party
+    delegationCid : ContractId Delegation
+    accruedAmount : Numeric 10
+  where
+    signatory validator
+    observer delegator
+
+    key (delegator, delegationCid) : (Party, ContractId Delegation)
+    maintainer key._1
+
+    ensure accruedAmount > 0.0
+
+    -- | Internal choice for the validator to add rewards during distribution.
+    choice AddReward : ContractId AccruedRewards
+      with
+        newRewardAmount : Numeric 10
+      controller validator
+      do
+        assertMsg "Reward amount must be positive" (newRewardAmount > 0.0)
+        create this with accruedAmount = accruedAmount + newRewardAmount
+
+    -- | Choice for the delegator to claim their rewards. In a real-world
+    -- | scenario, this would trigger a token transfer workflow. For simplicity,
+    -- | this choice archives the contract and returns the amount to be paid out.
+    choice ClaimRewards : Numeric 10
+      controller delegator
+      do
+        archive self
+        return accruedAmount
+
+    -- | Choice for the delegator to compound (re-stake) their accrued rewards.
+    -- | This increases the principal of their original delegation.
+    choice CompoundRewards : ContractId Delegation
+      controller delegator
+      do
+        -- This choice assumes the `Delegation` template has an `AddStake` choice
+        -- that allows increasing the staked amount.
+        -- e.g., choice AddStake : ContractId Delegation with additionalAmount: Numeric 10
+        newDelegationCid <- exercise delegationCid AddStake with additionalAmount = accruedAmount
+        archive self
+        return newDelegationCid
