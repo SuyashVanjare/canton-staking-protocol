@@ -1,0 +1,147 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Delegation where
+
+import DA.Time (Time, RelTime, subTime, addRelTime)
+import DA.Time.RelTime (toMicroseconds)
+import DA.Conversion (intToDecimal)
+import DA.Assert (assertMsg)
+import DA.Optional (isSome, fromSome, Optional(..))
+import StakePool (StakePool)
+
+-- | The state of a delegation, tracking its lifecycle from active staking to withdrawal.
+data DelegationState = Staked | Unbonding
+  deriving (Eq, Show, Ord)
+
+-- | Represents a delegator's staked position in a specific validator's stake pool.
+-- This contract tracks the amount staked, the state of the delegation, and is the
+-- basis for reward calculations and unbonding requests.
+template Delegation
+  with
+    operator : Party
+      -- ^ The operator of the stake pool.
+    validator : Party
+      -- ^ The validator node receiving the delegation.
+    delegator : Party
+      -- ^ The party who owns the staked tokens.
+    stakePoolCid : ContractId StakePool
+      -- ^ Reference to the parent StakePool contract, used to fetch pool parameters.
+    stakedAmount : Decimal
+      -- ^ The amount of tokens staked.
+    createdAt : Time
+      -- ^ The timestamp when the delegation was created.
+    lastRewardClaim : Time
+      -- ^ The timestamp of the last reward claim, initialized to `createdAt`.
+    state : DelegationState
+      -- ^ The current lifecycle state of the delegation (Staked, Unbonding).
+    unbondableAt : Optional Time
+      -- ^ If unbonding, the timestamp when the stake can be fully withdrawn.
+
+  where
+    signatory operator, delegator
+    observer validator
+
+    key (delegator, stakePoolCid) : (Party, ContractId StakePool)
+    maintainer key._1
+
+    ensure
+      stakedAmount > 0.0
+
+    -- | Choice for a delegator to initiate the unbonding process for their stake.
+    -- This moves the delegation into an 'Unbonding' state and starts the cooldown timer
+    -- based on the stake pool's configured `unbondingPeriod`.
+    choice RequestUnbond : ContractId Delegation
+      controller delegator
+      do
+        assertMsg "Delegation must be in 'Staked' state to request unbonding." $
+          this.state == Staked
+
+        pool <- fetch stakePoolCid
+        currentTime <- getTime
+
+        let withdrawTime = addRelTime currentTime pool.unbondingPeriod
+
+        create this with
+          state = Unbonding
+          unbondableAt = Some withdrawTime
+
+    -- | Choice for a delegator to withdraw their staked tokens after the unbonding
+    -- period has elapsed. This archives the delegation contract and returns the
+    -- staked amount to the caller, who is then responsible for the actual token transfer.
+    choice WithdrawStake : Decimal
+      controller delegator
+      do
+        assertMsg "Delegation must be in 'Unbonding' state to withdraw." $
+          this.state == Unbonding
+        assertMsg "Unbonding period has not yet passed." $
+          isSome this.unbondableAt
+
+        currentTime <- getTime
+        assertMsg ("Cannot withdraw before " <> show (fromSome this.unbondableAt)) $
+          currentTime >= fromSome this.unbondableAt
+
+        -- In a real implementation, this would likely exercise a choice on the
+        -- StakePool contract to update its total staked amount.
+        -- e.g., exercise stakePoolCid StakePool_RemoveDelegation with amount = this.stakedAmount
+
+        return this.stakedAmount
+
+    -- | Allows the stake pool operator to slash a portion of the delegated stake
+    -- as a penalty for validator misbehavior (e.g., downtime, double-signing).
+    -- Returns `None` if the entire stake is slashed, otherwise returns the new Delegation contract.
+    choice Slash : Optional (ContractId Delegation)
+      with
+        slashAmount : Decimal
+          -- ^ The amount of stake to be slashed.
+        reason : Text
+          -- ^ A description of why the slash is occurring.
+      controller operator
+      do
+        assertMsg "Slash amount must be positive." $
+          slashAmount > 0.0
+        assertMsg "Slash amount cannot exceed the total staked amount." $
+          slashAmount <= this.stakedAmount
+
+        let newStakedAmount = this.stakedAmount - slashAmount
+
+        -- Similar to WithdrawStake, this would trigger a corresponding update on the StakePool.
+        -- e.g., exercise stakePoolCid StakePool_RecordSlash with slashedAmount = slashAmount
+
+        if newStakedAmount <= 0.0 then do
+          archive self
+          return None
+        else do
+          newCid <- create this with stakedAmount = newStakedAmount
+          return (Some newCid)
+
+    -- | Calculates and claims rewards accrued since the last claim.
+    -- This choice returns the newly created Delegation contract (with an updated
+    -- claim time) and the amount of rewards earned. The caller is responsible for
+    -- creating the corresponding reward token transfer.
+    choice ClaimRewards : (ContractId Delegation, Decimal)
+      controller delegator
+      do
+        currentTime <- getTime
+        pool <- fetch stakePoolCid
+
+        assertMsg "No time has passed since the last claim to accrue rewards." $
+          currentTime > this.lastRewardClaim
+
+        let
+          timeDelta = currentTime `subTime` this.lastRewardClaim
+          timeDeltaMicroseconds = toMicroseconds timeDelta
+          timeDeltaSeconds = (intToDecimal timeDeltaMicroseconds) / 1_000_000.0
+
+          -- Assuming 365.25 days per year for leap year accuracy.
+          secondsInYear = 31_557_600.0 -- 365.25 * 24 * 60 * 60
+          rewardRatePerSecond = pool.rewardRatePerAnnum / secondsInYear
+
+          rewardAmount = this.stakedAmount * rewardRatePerSecond * timeDeltaSeconds
+
+        assertMsg "No rewards have been accrued." $ rewardAmount > 0.0
+
+        newDelegationCid <- create this with
+          lastRewardClaim = currentTime
+
+        return (newDelegationCid, rewardAmount)
