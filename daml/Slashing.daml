@@ -1,0 +1,125 @@
+-- |
+-- Copyright (c) 2024, Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+--
+
+module Slashing where
+
+import DA.Time (Time)
+import DA.Assert (assert)
+
+import StakePool (StakePool)
+
+-- | Defines the reason for a validator being slashed.
+-- This provides structured information about the misbehaviour to ensure transparency
+-- and allow for proper auditing.
+data SlashReason
+  = Downtime
+      { periodStart : Time
+      , periodEnd : Time
+      , description : Text
+      }
+  | DoubleSigning
+      { blockHeight : Int
+      , evidenceDigest : Text -- e.g., a SHA256 hash of the conflicting signed messages
+      }
+  | GovernanceMisconduct
+      { description : Text
+      , evidenceLink : Text -- e.g., a URL to an IPFS hash or an off-chain report
+      }
+  deriving (Eq, Show, Ord)
+
+-- | A proposal to slash a validator for reported misbehaviour.
+-- This contract requires confirmation from the network operator before the penalty is applied,
+-- creating a control point to prevent malicious or incorrect slashing reports.
+template SlashProposal
+  with
+    operator : Party
+      -- ^ The central party responsible for validating and executing slash proposals.
+    reporter : Party
+      -- ^ The party that observed and reported the misbehaviour.
+    validator : Party
+      -- ^ The validator accused of misbehaviour.
+    poolCid : ContractId StakePool
+      -- ^ The contract ID of the validator's stake pool to be slashed.
+    reason : SlashReason
+      -- ^ The specific reason for the proposed slash.
+    slashPercentage : Decimal
+      -- ^ The percentage of the total pool stake to be slashed. Must be between 0.0 and 1.0.
+    proposalTime : Time
+      -- ^ The timestamp when the proposal was created.
+  where
+    signatory reporter, operator
+
+    ensure
+      slashPercentage > 0.0 && slashPercentage <= 1.0
+
+    observer validator
+
+    choice ConfirmSlash : ContractId SlashedEvent
+      -- ^ The operator confirms the evidence is valid and applies the slash.
+      -- This action is non-revocable and will penalize the stake pool by burning
+      -- a portion of the total staked tokens.
+      controller operator
+      do
+        -- Fetch the stake pool to calculate the slash amount and verify operator
+        pool <- fetch poolCid
+        assert (operator == pool.operator)
+
+        let amountToSlash = pool.totalStaked * slashPercentage
+
+        -- Exercise the choice on the StakePool to apply the penalty.
+        -- This choice is expected to be defined in `StakePool.daml` and should
+        -- reduce the `totalStaked` amount, effectively penalizing all delegators
+        -- in the pool proportionally.
+        --
+        -- Expected choice signature in StakePool.daml:
+        -- choice ApplySlash : ContractId StakePool
+        --   with amountToSlash : Decimal
+        --   controller operator
+        --   do create self with totalStaked = self.totalStaked - amountToSlash
+        _ <- exercise poolCid ApplySlash with amountToSlash
+
+        -- Archive this proposal and create a permanent record of the event.
+        slashedAt <- getTime
+        create SlashedEvent with
+          operator
+          validator
+          reporter
+          poolCid
+          reason
+          slashedAmount = amountToSlash
+          slashPercentage
+          slashedAt
+
+    choice RejectSlash : ()
+      -- ^ The operator rejects the proposal due to insufficient evidence or other reasons.
+      -- This archives the proposal without applying any penalty.
+      controller operator
+      do
+        archive self
+
+-- | A permanent, on-ledger record of a slashing event that has been executed.
+-- This contract serves as an immutable audit trail for penalties applied to validators,
+-- ensuring full transparency of network security operations.
+template SlashedEvent
+  with
+    operator : Party
+      -- ^ The party that confirmed the slash.
+    validator : Party
+      -- ^ The validator who was slashed.
+    reporter : Party
+      -- ^ The party that reported the incident.
+    poolCid : ContractId StakePool
+      -- ^ The stake pool that was affected at the time of slashing.
+    reason : SlashReason
+      -- ^ The reason for the slash.
+    slashedAmount : Decimal
+      -- ^ The total amount of tokens deducted (burned) from the stake pool.
+    slashPercentage : Decimal
+      -- ^ The percentage of the pool's stake that was slashed.
+    slashedAt : Time
+      -- ^ The timestamp of when the slash was executed.
+  where
+    signatory operator, validator
+    observer reporter
