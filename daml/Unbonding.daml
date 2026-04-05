@@ -1,0 +1,62 @@
+module Unbonding where
+
+import DA.Time (Time)
+import DA.Assert ((assert))
+
+-- | Represents a successful withdrawal of unbonded tokens.
+-- This contract would typically be consumed by a settlement process
+-- or converted back into a fungible token contract.
+template WithdrawnFunds
+  with
+    operator: Party
+    validator: Party
+    owner: Party
+    amount: Decimal
+  where
+    signatory operator, validator
+    observer owner
+
+-- | Represents a delegator's tokens that are in the unbonding (cooldown) period.
+-- After the `releaseTime` has passed, the delegator can withdraw the funds.
+-- This contract is created by the `Pool` contract when a delegator initiates
+-- an unbonding request.
+template Unbonding
+  with
+    operator: Party
+      -- ^ The main operator of the staking protocol.
+    validator: Party
+      -- ^ The validator of the pool from which tokens are being unbonded.
+    delegator: Party
+      -- ^ The owner of the tokens being unbonded.
+    poolId: Text
+      -- ^ The unique identifier of the staking pool.
+    amount: Decimal
+      -- ^ The amount of tokens in the unbonding queue.
+    releaseTime: Time
+      -- ^ The timestamp after which the tokens can be withdrawn.
+  where
+    signatory operator, validator
+    observer delegator
+
+    key (operator, validator, delegator, poolId, releaseTime) : (Party, Party, Party, Text, Time)
+    maintainer key._1, key._2
+
+    choice WithdrawUnbonded : ContractId WithdrawnFunds
+      -- | Allows the delegator to claim their tokens after the unbonding
+      -- | period has concluded. This action archives the `Unbonding` contract
+      -- | and creates a `WithdrawnFunds` contract representing the liquid assets.
+      controller delegator
+      do
+        now <- getTime
+        assert (now >= releaseTime)
+          $ "Withdrawal attempt failed: unbonding period has not yet elapsed. "
+          <> "Available for withdrawal after " <> show releaseTime <> "."
+
+        -- In a real implementation, this might trigger a more complex settlement
+        -- process or create a fungible token contract. For this protocol, we
+        -- create a simple `WithdrawnFunds` contract to represent the released assets.
+        create WithdrawnFunds with
+          operator
+          validator
+          owner = delegator
+          amount
