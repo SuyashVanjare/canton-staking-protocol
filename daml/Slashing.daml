@@ -1,125 +1,103 @@
--- |
--- Copyright (c) 2024, Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
---
 
 module Slashing where
 
 import DA.Time (Time)
-import DA.Assert (assert)
+import Daml.Finance.Interface.Asset.Fungible qualified as Fungible (Quantity)
 
-import StakePool (StakePool)
+import Pool (Id, ValidatorPool)
 
--- | Defines the reason for a validator being slashed.
--- This provides structured information about the misbehaviour to ensure transparency
--- and allow for proper auditing.
+
+-- | Specifies the reason for a validator slashing event.
 data SlashReason
   = Downtime
-      { periodStart : Time
-      , periodEnd : Time
-      , description : Text
-      }
+    -- ^ Validator was offline or non-responsive for an extended period.
   | DoubleSigning
-      { blockHeight : Int
-      , evidenceDigest : Text -- e.g., a SHA256 hash of the conflicting signed messages
-      }
-  | GovernanceMisconduct
-      { description : Text
-      , evidenceLink : Text -- e.g., a URL to an IPFS hash or an off-chain report
-      }
+    -- ^ Validator signed conflicting blocks at the same height.
+  | OtherMisbehaviour Text
+    -- ^ Other protocol violations with a descriptive message.
   deriving (Eq, Show, Ord)
 
--- | A proposal to slash a validator for reported misbehaviour.
--- This contract requires confirmation from the network operator before the penalty is applied,
--- creating a control point to prevent malicious or incorrect slashing reports.
+-- | Payload for the `Slash` choice on the `ValidatorPool` contract. This defines the
+-- | parameters for a slashing event. It is defined here to be shared between the
+-- | proposal contract and the validator pool logic.
+data SlashArgs = SlashArgs
+  { slashAmount : Fungible.Quantity
+    -- ^ The quantity of the staked asset to be slashed from the pool.
+  , recipient : Party
+    -- ^ The party designated to receive the slashed funds (e.g., a community treasury).
+  , reason : SlashReason
+    -- ^ The justification for the slash.
+  } deriving (Eq, Show)
+
+
+-- | A proposal to slash a validator's stake due to misbehaviour.
+-- |
+-- | This contract is created by a network governor and must be explicitly enforced to
+-- | trigger the actual slashing on the `ValidatorPool` contract. It represents an
+-- | accusation that the validator can see and potentially challenge.
 template SlashProposal
   with
-    operator : Party
-      -- ^ The central party responsible for validating and executing slash proposals.
-    reporter : Party
-      -- ^ The party that observed and reported the misbehaviour.
+    governor : Party
+      -- ^ The party authorized to propose and enforce slashing (e.g., network governance).
     validator : Party
-      -- ^ The validator accused of misbehaviour.
-    poolCid : ContractId StakePool
-      -- ^ The contract ID of the validator's stake pool to be slashed.
+      -- ^ The operator of the validator node being accused.
+    poolId : Id
+      -- ^ The unique identifier of the validator pool being targeted.
+    validatorPoolCid : ContractId ValidatorPool
+      -- ^ The contract ID of the `ValidatorPool` to be slashed.
+    slashAmount : Fungible.Quantity
+      -- ^ The quantity of the staked asset to be slashed.
+    slashRecipient : Party
+      -- ^ The party to receive the slashed funds.
     reason : SlashReason
-      -- ^ The specific reason for the proposed slash.
-    slashPercentage : Decimal
-      -- ^ The percentage of the total pool stake to be slashed. Must be between 0.0 and 1.0.
-    proposalTime : Time
+      -- ^ The reason for the proposed slash.
+    evidence : Text
+      -- ^ A description or link to evidence supporting the slash proposal.
+    createdAt : Time
       -- ^ The timestamp when the proposal was created.
   where
-    signatory reporter, operator
-
-    ensure
-      slashPercentage > 0.0 && slashPercentage <= 1.0
-
+    signatory governor
     observer validator
 
-    choice ConfirmSlash : ContractId SlashedEvent
-      -- ^ The operator confirms the evidence is valid and applies the slash.
-      -- This action is non-revocable and will penalize the stake pool by burning
-      -- a portion of the total staked tokens.
-      controller operator
+    ensure
+      slashAmount.quantity > 0.0
+        && "Slash amount must be positive."
+
+    -- | Enforces the slashing proposal, invoking the `Slash` choice on the
+    -- | `ValidatorPool` contract. This action consumes the proposal upon success.
+    choice EnforceSlash : ()
+      controller governor
       do
-        -- Fetch the stake pool to calculate the slash amount and verify operator
-        pool <- fetch poolCid
-        assert (operator == pool.operator)
+        -- Verify that the proposal is being applied to the correct pool instance.
+        -- This prevents applying a slash to a stale contract if the pool has been updated.
+        pool <- fetch validatorPoolCid
+        assertMsg "Mismatched pool ID on slash enforcement" (pool.id == this.poolId)
 
-        let amountToSlash = pool.totalStaked * slashPercentage
+        let slashArgs = SlashArgs with
+              slashAmount = this.slashAmount
+              recipient = this.slashRecipient
+              reason = this.reason
 
-        -- Exercise the choice on the StakePool to apply the penalty.
-        -- This choice is expected to be defined in `StakePool.daml` and should
-        -- reduce the `totalStaked` amount, effectively penalizing all delegators
-        -- in the pool proportionally.
-        --
-        -- Expected choice signature in StakePool.daml:
-        -- choice ApplySlash : ContractId StakePool
-        --   with amountToSlash : Decimal
-        --   controller operator
-        --   do create self with totalStaked = self.totalStaked - amountToSlash
-        _ <- exercise poolCid ApplySlash with amountToSlash
+        -- The `Slash` choice on the `ValidatorPool` is expected to be consuming. It
+        -- handles the reduction of stake and the transfer of slashed funds, returning
+        -- the contract ID of the updated pool state.
+        -- This proposal is consumed as part of this atomic transaction.
+        exercise validatorPoolCid Slash slashArgs
+        return ()
 
-        -- Archive this proposal and create a permanent record of the event.
-        slashedAt <- getTime
-        create SlashedEvent with
-          operator
-          validator
-          reporter
-          poolCid
-          reason
-          slashedAmount = amountToSlash
-          slashPercentage
-          slashedAt
-
-    choice RejectSlash : ()
-      -- ^ The operator rejects the proposal due to insufficient evidence or other reasons.
-      -- This archives the proposal without applying any penalty.
-      controller operator
+    -- | Allows the governor to withdraw the slashing proposal before it is
+    -- | enforced or challenged. This simply archives the proposal.
+    choice WithdrawProposal : ()
+      controller governor
       do
-        archive self
+        return ()
 
--- | A permanent, on-ledger record of a slashing event that has been executed.
--- This contract serves as an immutable audit trail for penalties applied to validators,
--- ensuring full transparency of network security operations.
-template SlashedEvent
-  with
-    operator : Party
-      -- ^ The party that confirmed the slash.
-    validator : Party
-      -- ^ The validator who was slashed.
-    reporter : Party
-      -- ^ The party that reported the incident.
-    poolCid : ContractId StakePool
-      -- ^ The stake pool that was affected at the time of slashing.
-    reason : SlashReason
-      -- ^ The reason for the slash.
-    slashedAmount : Decimal
-      -- ^ The total amount of tokens deducted (burned) from the stake pool.
-    slashPercentage : Decimal
-      -- ^ The percentage of the pool's stake that was slashed.
-    slashedAt : Time
-      -- ^ The timestamp of when the slash was executed.
-  where
-    signatory operator, validator
-    observer reporter
+    -- | Allows the validator to formally challenge the slashing proposal.
+    -- | In this simple implementation, challenging archives the proposal. A more
+    -- | complex system could escalate this to a dedicated dispute resolution contract.
+    choice ChallengeProposal : ()
+      controller validator
+      do
+        return ()
