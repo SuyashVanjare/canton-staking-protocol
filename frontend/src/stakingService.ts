@@ -1,228 +1,197 @@
-import { ContractId, Party, Decimal, Time } from '@daml/types';
+import { ContractId } from '@daml/types';
 
-// =========================================================================================
-// Constants and Configuration
-// =========================================================================================
+// NOTE: This file assumes the existence of the following Daml templates and choices.
+// The template IDs are hardcoded for simplicity but would typically come from a
+// shared configuration or code generation.
+//
+// Template: Staking.StakePool
+//   - Choice: Delegate (with { delegator: Party, tokenCid: ContractId Token.Token, amount: Decimal })
+// Template: Staking.Delegation
+//   - Choice: RequestUnbond (with { amountToUnbond: Decimal })
+//   - Choice: ClaimReward
+// Template: Unbonding.UnbondingRequest
+//   - Choice: Claim
+// Template: Token.Token (or similar fungible token contract)
 
-const JSON_API_URL = process.env.REACT_APP_JSON_API_URL || 'http://localhost:7575';
-const TEMPLATE_IDS = {
-    ValidatorPool: 'Staking:ValidatorPool',
-    Delegation: 'Staking:Delegation',
-    UnbondingRequest: 'Staking:UnbondingRequest',
-    AccruedReward: 'Reward:AccruedReward',
+const LEDGER_URL = process.env.REACT_APP_LEDGER_URL || 'http://localhost:7575';
+const API_BASE = `${LEDGER_URL}/v1`;
+
+const templateIds = {
+  StakePool: 'Staking:StakePool',
+  Delegation: 'Staking:Delegation',
+  UnbondingRequest: 'Unbonding:UnbondingRequest',
+  // Assuming a simple fungible token template for the stakeable asset
+  FungibleToken: 'Token:Token',
 };
 
-// =========================================================================================
-// Type Definitions (mirroring Daml templates)
-// =========================================================================================
+// --- TYPE DEFINITIONS ---
+// These interfaces represent the expected structure of the Daml contract payloads.
 
-export interface DamlContract<T> {
-    contractId: ContractId<T>;
-    templateId: string;
-    payload: T;
+export interface ApiContract<T> {
+  contractId: ContractId;
+  templateId: string;
+  payload: T;
 }
 
-export interface ValidatorPool {
-    validator: Party;
-    operator: Party;
-    poolId: string;
-    tokenSymbol: string;
-    totalStaked: Decimal;
-    commissionRate: Decimal;
-    maxCommissionRate: Decimal;
-    lastCommissionUpdateTime: Time;
+export interface StakePool {
+  operator: string;
+  validator: string;
+  stakedTokenSymbol: string;
+  rewardTokenSymbol: string;
+  totalStaked: string; // Decimal
+  delegatorCount: string; // Int
+  commissionRate: string; // Decimal
+  lastRewardUpdate: string; // Time
 }
 
 export interface Delegation {
-    delegator: Party;
-    validator: Party;
-    poolId: string;
-    stakedAmount: Decimal;
-    initialStakeTime: Time;
+  delegator: string;
+  validator: string;
+  stakedAmount: string; // Decimal
+  rewardDebt: string; // Decimal
 }
 
 export interface UnbondingRequest {
-    delegator: Party;
-    validator: Party;
-    poolId: string;
-    amount: Decimal;
-    unlockTime: Time;
+  delegator: string;
+  validator: string;
+  unbondingAmount: string; // Decimal
+  availableAt: string; // Time
 }
 
-export interface AccruedReward {
-    delegator: Party;
-    validator: Party;
-    poolId: string;
-    rewardAmount: Decimal;
+// --- PRIVATE HELPERS ---
+
+/**
+ * A helper function to wrap fetch calls to the JSON API, handling authorization
+ * and error handling.
+ * @param token The JWT token for authorization.
+ * @param endpoint The API endpoint to call (e.g., '/query').
+ * @param body The JSON body for the request.
+ */
+async function ledgerFetch(token: string, endpoint: string, body: object): Promise<any> {
+  const response = await fetch(`${API_BASE}${endpoint}`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`Ledger API request failed with status ${response.status}:`, errorBody);
+    throw new Error(`Ledger API Error: ${response.statusText}`);
+  }
+
+  return response.json();
 }
 
-// =========================================================================================
-// Generic API Fetcher
-// =========================================================================================
-
 /**
- * A generic fetch wrapper for the Daml JSON API.
- * @param endpoint The API endpoint (e.g., '/v1/query').
- * @param token The JWT for authentication.
- * @param body The request body.
- * @returns The JSON response from the API.
+ * Performs a query against the ledger's active contract set.
+ * @param token The JWT token for authorization.
+ * @param templateId The template ID to query for.
+ * @param query An optional query payload.
  */
-async function apiFetch(endpoint: string, token: string, body: object): Promise<any> {
-    const response = await fetch(`${JSON_API_URL}${endpoint}`, {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(body),
-    });
-
-    if (!response.ok) {
-        const errorText = await response.text();
-        console.error('Daml API Error:', errorText);
-        throw new Error(`API request failed with status ${response.status}: ${errorText}`);
-    }
-
-    return response.json();
+async function queryLedger<T>(token: string, templateId: string, query: object = {}): Promise<ApiContract<T>[]> {
+  const body = {
+    templateIds: [templateId],
+    query,
+  };
+  const result = await ledgerFetch(token, '/query', body);
+  return result.result || [];
 }
 
-// =========================================================================================
-// Query Functions
-// =========================================================================================
+/**
+ * Executes a choice on a given contract.
+ * @param token The JWT token for authorization.
+ * @param templateId The template ID of the contract.
+ * @param contractId The ID of the contract to exercise the choice on.
+ * @param choice The name of the choice to exercise.
+ * @param argument The argument payload for the choice.
+ */
+async function exerciseChoice(token: string, templateId: string, contractId: ContractId, choice: string, argument: object): Promise<any> {
+  const body = {
+    templateId,
+    contractId,
+    choice,
+    argument,
+  };
+  const result = await ledgerFetch(token, '/exercise', body);
+  return result.result;
+}
+
+
+// --- PUBLIC SERVICE FUNCTIONS ---
 
 /**
- * Fetches all active ValidatorPool contracts.
- * @param token The JWT for authentication.
+ * Fetches all available stake pools on the ledger.
  */
-export const fetchValidatorPools = async (token: string): Promise<DamlContract<ValidatorPool>[]> => {
-    const body = { templateIds: [TEMPLATE_IDS.ValidatorPool] };
-    const response = await apiFetch('/v1/query', token, body);
-    return response.result;
+export const getStakePools = async (token: string): Promise<ApiContract<StakePool>[]> => {
+  return queryLedger<StakePool>(token, templateIds.StakePool);
 };
 
 /**
- * Fetches all Delegation contracts for a specific delegator.
- * @param delegator The party whose delegations to fetch.
- * @param token The JWT for authentication.
+ * Fetches all active delegations for a given party.
  */
-export const fetchDelegations = async (delegator: Party, token:string): Promise<DamlContract<Delegation>[]> => {
-    const body = {
-        templateIds: [TEMPLATE_IDS.Delegation],
-        query: { delegator },
-    };
-    const response = await apiFetch('/v1/query', token, body);
-    return response.result;
+export const getDelegationsByParty = async (token: string, party: string): Promise<ApiContract<Delegation>[]> => {
+  return queryLedger<Delegation>(token, templateIds.Delegation, { delegator: party });
 };
 
 /**
- * Fetches all active UnbondingRequest contracts for a specific delegator.
- * @param delegator The party whose unbonding requests to fetch.
- * @param token The JWT for authentication.
+ * Fetches all active unbonding requests for a given party.
  */
-export const fetchUnbondingRequests = async (delegator: Party, token: string): Promise<DamlContract<UnbondingRequest>[]> => {
-    const body = {
-        templateIds: [TEMPLATE_IDS.UnbondingRequest],
-        query: { delegator },
-    };
-    const response = await apiFetch('/v1/query', token, body);
-    return response.result;
+export const getUnbondingRequestsByParty = async (token: string, party: string): Promise<ApiContract<UnbondingRequest>[]> => {
+  return queryLedger<UnbondingRequest>(token, templateIds.UnbondingRequest, { delegator: party });
 };
 
 /**
- * Fetches all claimable AccruedReward contracts for a specific delegator.
- * @param delegator The party whose rewards to fetch.
- * @param token The JWT for authentication.
+ * Stakes a given amount of a token into a validator's pool.
+ * @param token The JWT token for authorization.
+ * @param delegator The party who is staking.
+ * @param validator The party of the validator's pool to stake into.
+ * @param tokenCid The ContractId of the fungible token contract to be staked.
+ * @param amount The decimal amount to stake.
  */
-export const fetchRewards = async (delegator: Party, token: string): Promise<DamlContract<AccruedReward>[]> => {
-    const body = {
-        templateIds: [TEMPLATE_IDS.AccruedReward],
-        query: { delegator },
-    };
-    const response = await apiFetch('/v1/query', token, body);
-    return response.result;
-};
+export const stakeTokens = async (token: string, delegator: string, validator: string, tokenCid: ContractId, amount: string): Promise<any> => {
+  const pools = await queryLedger<StakePool>(token, templateIds.StakePool, { validator });
+  if (pools.length === 0) {
+    throw new Error(`No stake pool found for validator ${validator}`);
+  }
+  const pool = pools[0];
 
-// =========================================================================================
-// Command (Exercise) Functions
-// =========================================================================================
-
-/**
- * Delegates (stakes) a certain amount of tokens to a validator pool.
- * @param poolCid The contract ID of the ValidatorPool to delegate to.
- * @param delegator The party performing the delegation.
- * @param amount The amount to stake.
- * @param token The JWT for authentication.
- */
-export const delegateToPool = async (
-    poolCid: ContractId<ValidatorPool>,
-    delegator: Party,
-    amount: Decimal,
-    token: string
-): Promise<any> => {
-    const body = {
-        templateId: TEMPLATE_IDS.ValidatorPool,
-        contractId: poolCid,
-        choice: 'Delegate',
-        argument: {
-            delegator,
-            amount,
-        },
-    };
-    return apiFetch('/v1/exercise', token, body);
+  return exerciseChoice(token, templateIds.StakePool, pool.contractId, 'Delegate', {
+    delegator,
+    tokenCid,
+    amount,
+  });
 };
 
 /**
- * Initiates the unbonding process for a staked amount.
- * @param delegationCid The contract ID of the Delegation to unbond from.
- * @param amountToUnbond The amount to unbond.
- * @param token The JWT for authentication.
+ * Initiates the unbonding process for a portion of a delegation.
+ * @param token The JWT token for authorization.
+ * @param delegationCid The ContractId of the delegation to unbond from.
+ * @param amountToUnbond The decimal amount to unbond.
  */
-export const requestUnbond = async (
-    delegationCid: ContractId<Delegation>,
-    amountToUnbond: Decimal,
-    token: string
-): Promise<any> => {
-    const body = {
-        templateId: TEMPLATE_IDS.Delegation,
-        contractId: delegationCid,
-        choice: 'RequestUnbond',
-        argument: { amountToUnbond },
-    };
-    return apiFetch('/v1/exercise', token, body);
+export const initiateUnbonding = async (token: string, delegationCid: ContractId, amountToUnbond: string): Promise<any> => {
+  return exerciseChoice(token, templateIds.Delegation, delegationCid, 'RequestUnbond', {
+    amountToUnbond,
+  });
 };
 
 /**
- * Withdraws unbonded tokens after the cooldown period has passed.
- * @param unbondingRequestCid The contract ID of the UnbondingRequest to withdraw.
- * @param token The JWT for authentication.
+ * Claims unbonded tokens that have passed their cooldown period.
+ * @param token The JWT token for authorization.
+ * @param unbondingRequestCid The ContractId of the completed UnbondingRequest.
  */
-export const withdrawUnbondedTokens = async (
-    unbondingRequestCid: ContractId<UnbondingRequest>,
-    token: string
-): Promise<any> => {
-    const body = {
-        templateId: TEMPLATE_IDS.UnbondingRequest,
-        contractId: unbondingRequestCid,
-        choice: 'Withdraw',
-        argument: {},
-    };
-    return apiFetch('/v1/exercise', token, body);
+export const claimUnbondedTokens = async (token:string, unbondingRequestCid: ContractId): Promise<any> => {
+  return exerciseChoice(token, templateIds.UnbondingRequest, unbondingRequestCid, 'Claim', {});
 };
 
 /**
- * Claims accrued rewards from a validator.
- * @param rewardCid The contract ID of the AccruedReward to claim.
- * @param token The JWT for authentication.
+ * Claims any accrued rewards from a delegation.
+ * @param token The JWT token for authorization.
+ * @param delegationCid The ContractId of the delegation to claim rewards from.
  */
-export const claimRewards = async (
-    rewardCid: ContractId<AccruedReward>,
-    token: string
-): Promise<any> => {
-    const body = {
-        templateId: TEMPLATE_IDS.AccruedReward,
-        contractId: rewardCid,
-        choice: 'ClaimReward',
-        argument: {},
-    };
-    return apiFetch('/v1/exercise', token, body);
+export const claimRewards = async (token: string, delegationCid: ContractId): Promise<any> => {
+  return exerciseChoice(token, templateIds.Delegation, delegationCid, 'ClaimReward', {});
 };
