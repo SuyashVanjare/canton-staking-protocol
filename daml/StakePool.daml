@@ -1,275 +1,210 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 module StakePool where
 
-import DA.Set (Set)
-import qualified DA.Set as Set
-import DA.Date (Date, addDays)
-import DA.Time (Time, relTime, subTime, microseconds)
-import DA.Action (getTime, date)
+import Daml.Finance.Interface.Types.Common.Types (InstrumentKey)
+import Daml.Finance.Interface.Holding.Factory qualified as HoldingFactory (F(..))
+import Daml.Finance.Interface.Holding.Fungible qualified as Fungible (I, View(..))
+import Daml.Finance.Interface.Holding.Transferable qualified as Transferable (F(..))
+import DA.Time (Time, addRelTime, days, getTime)
+import DA.Map qualified as Map
+import DA.Optional (fromSomeNote, fromMaybe)
 import DA.Assert ((assert, assertMsg))
-import DA.Numeric (Decimal, intToDecimal)
+import DA.Numeric (Decimal, (%), (+), (-), (/))
+import Unbonding (UnbondingTicket(..))
 
--- Helper to convert the difference between two Time values into a Decimal number of seconds.
--- This is crucial for precise reward calculations.
-timeDeltaToDecimalSeconds: Time -> Time -> Decimal
-timeDeltaToDecimalSeconds t1 t2 =
-  let diff = subTime t1 t2
-  in intToDecimal (microseconds diff) / 1_000_000.0
+-- | Represents a delegator's position within a stake pool.
+data Delegation = Delegation
+  with
+    amount : Decimal
+      -- ^ The amount of tokens staked by the delegator.
+    rewardDebt : Decimal
+      -- ^ The `rewardsPerUnitStaked` value from the pool at the time of the delegator's last
+      -- ^ transaction (stake, unstake, or claim). Used to calculate pending rewards.
+  deriving (Eq, Show)
 
--- Main contract representing a validator's staking pool.
+-- | A validator-operated pool where token holders can delegate (stake) their tokens
+-- | to earn rewards.
 template StakePool
   with
-    validator: Party
-    delegators: Set Party
-    assetSymbol: Text
+    operator: Party
+      -- ^ The validator operating the stake pool.
+    token: InstrumentKey
+      -- ^ The token instrument being staked.
+    delegations: Map.Map Party Delegation
+      -- ^ A map from each delegator's party to their delegation details.
     totalStaked: Decimal
-    rewardApr: Decimal -- Annual Percentage Rate, e.g., 0.05 for 5%
-    lastRewardUpdateTime: Time
-    -- Core of the precise reward calculation. It accumulates rewards per token over time,
-    -- allowing for efficient, per-delegator reward calculation without iteration.
-    accumulatedRewardPerToken: Decimal
-    slashingPenalty: Decimal -- Penalty percentage, e.g., 0.01 for 1%
+      -- ^ The total amount of tokens staked across all delegators in this pool.
+    rewardsPerUnitStaked: Decimal
+      -- ^ Cumulative rewards distributed per unit of token staked. This is the primary
+      -- ^ mechanism for tracking reward accrual.
     unbondingPeriodDays: Int
+      -- ^ The number of days a delegator must wait to withdraw their tokens after initiating
+      -- ^ an unbond.
+    lastRewardUpdateTime: Time
+      -- ^ Timestamp of the last reward distribution.
+    holdingFactoryCid: ContractId HoldingFactory.F
+      -- ^ The factory contract for minting token holdings (used for reward payouts).
   where
-    signatory validator
-    observer Set.toList delegators
+    signatory operator
+    observer Map.keys delegations
 
-    key validator : Party
-    maintainer key
-
-    -- A non-consuming choice that updates the pool's reward state based on time elapsed.
-    -- This is the first step in any choice that modifies the pool's stake, ensuring
-    -- calculations are always based on the latest state.
-    choice UpdateRewardState: ContractId StakePool
-      controller validator, Set.toList delegators
-      do
-        now <- getTime
-        let timeDelta = timeDeltaToDecimalSeconds now lastRewardUpdateTime
-
-        -- Avoid division by zero if APR is defined over a zero-length period (unlikely).
-        -- APR is converted to a per-second rate for calculation.
-        let secondsInYear = 365.0 * 24.0 * 60.0 * 60.0
-        let rewardRatePerSecond = rewardApr / secondsInYear
-
-        -- Calculate new rewards generated per token during the time delta.
-        -- If no tokens are staked, no rewards are generated for the pool.
-        let newRewardPerToken = if totalStaked > 0.0
-                                then timeDelta * rewardRatePerSecond
-                                else 0.0
-
-        let newAccumulatedRewardPerToken = accumulatedRewardPerToken + newRewardPerToken
-
-        -- Recreate the pool with updated time and reward accumulator.
-        create this with
-          lastRewardUpdateTime = now,
-          accumulatedRewardPerToken = newAccumulatedRewardPerToken
-
-    choice Delegate: ContractId Delegation
-      with
-        delegator: Party
-        amount: Decimal
-      controller delegator
-      do
-        assertMsg "Delegation amount must be positive." (amount > 0.0)
-
-        -- Step 1: Update the pool's reward state to correctly account for rewards
-        -- accrued up to this point, before adding the new stake.
-        updatedPoolCid <- exercise self (UpdateRewardState)
-        updatedPool <- fetch updatedPoolCid
-
-        -- Step 2: Find if an existing delegation exists and update it, or create a new one.
-        existingDelegationCids <- query @Delegation with delegator, validator
-        let newTotalStaked = updatedPool.totalStaked + amount
-
-        finalDelegationCid <- case existingDelegationCids of
-          -- New delegator.
-          [] -> do
-            create Delegation with
-              validator = updatedPool.validator
-              delegator
-              amount
-              poolCid = updatedPoolCid
-              -- The initial reward debt is the current accumulated value.
-              rewardDebt = updatedPool.accumulatedRewardPerToken
-
-          -- Existing delegator adding more stake.
-          [delegationCid] -> do
-            delegation <- fetch delegationCid
-            -- NOTE: Any pending rewards are implicitly compounded. A ClaimRewards choice
-            -- should be exercised first if the user wants to withdraw them.
-
-            let newDelegationAmount = delegation.amount + amount
-            archive delegationCid
-            create delegation with
-              amount = newDelegationAmount,
-              poolCid = updatedPoolCid,
-              -- Reset reward debt to the latest value to checkpoint the rewards.
-              rewardDebt = updatedPool.accumulatedRewardPerToken
-
-          _ -> abort "Invariant violation: Multiple delegations found for the same delegator."
-
-        -- Step 3: Re-create the pool with the updated total stake and delegators set.
-        archive updatedPoolCid
-        create updatedPool with
-          totalStaked = newTotalStaked,
-          delegators = Set.insert delegator updatedPool.delegators
-
-        return finalDelegationCid
-
-    choice Slash: ContractId StakePool
-      with
-        slashedDelegator: Party
-        reason: Text
-      controller validator
-      do
-        assertMsg "Slashed delegator must be a member of the pool." (Set.member slashedDelegator delegators)
-
-        updatedPoolCid <- exercise self (UpdateRewardState)
-        updatedPool <- fetch updatedPoolCid
-
-        [delegationCid] <- query @Delegation with delegator = slashedDelegator, validator
-        delegation <- fetch delegationCid
-
-        let penaltyAmount = delegation.amount * updatedPool.slashingPenalty
-        let newDelegationAmount = delegation.amount - penaltyAmount
-        assertMsg "Penalty cannot exceed staked amount." (newDelegationAmount >= 0.0)
-
-        archive delegationCid
-        let newDelegators = if newDelegationAmount <= 0.0 then
-                              Set.delete slashedDelegator updatedPool.delegators
-                            else
-                              updatedPool.delegators
-
-        -- If stake remains, re-create the delegation with the reduced amount.
-        when (newDelegationAmount > 0.0) do
-          create delegation with
-            amount = newDelegationAmount,
-            poolCid = updatedPoolCid,
-            rewardDebt = updatedPool.accumulatedRewardPerToken
-
-        archive updatedPoolCid
-        create updatedPool with
-          totalStaked = updatedPool.totalStaked - penaltyAmount,
-          delegators = newDelegators
-
--- Represents an individual's stake in a specific pool.
-template Delegation
-  with
-    validator: Party
-    delegator: Party
-    amount: Decimal
-    poolCid: ContractId StakePool
-    -- Stores the 'accumulatedRewardPerToken' from the pool at the last point of interaction.
-    -- This is used to calculate pending rewards: `amount * (current_accumulated - rewardDebt)`.
-    rewardDebt: Decimal
-  where
-    signatory validator, delegator
-
-    key (validator, delegator) : (Party, Party)
+    key (operator, token) : (Party, InstrumentKey)
     maintainer key._1
 
-    choice Unbond: ContractId UnbondingDelegation
+    ensure
+      let calculatedTotal = sum $ map (\d -> d.amount) (Map.values delegations)
+      in totalStaked == calculatedTotal
+          && totalStaked >= 0.0
+          && unbondingPeriodDays >= 0
+
+    -- | A helper function to calculate the pending rewards for a specific delegator.
+    -- | Formula: `pending = (current rewardsPerUnitStaked - delegator's rewardDebt) * delegator's stake`
+    let calculatePending delegator =
+          case Map.lookup delegator delegations of
+            None -> 0.0
+            Some delegation ->
+              (rewardsPerUnitStaked - delegation.rewardDebt) * delegation.amount
+
+    -- | A delegator stakes a given amount of tokens into the pool.
+    -- | Any pending rewards for the delegator are paid out before the new stake is added.
+    choice Delegate : ContractId StakePool
       with
-        unbondAmount: Decimal
+        delegator : Party
+        holdingCid : ContractId Fungible.I
+          -- ^ The holding of tokens to be staked.
       controller delegator
       do
-        assertMsg "Unbond amount must be positive." (unbondAmount > 0.0)
-        assertMsg "Cannot unbond more than staked amount." (unbondAmount <= amount)
+        -- Fetch and validate the holding to be staked.
+        holdingView <- view ghover holdingCid
+        let stakeAmount = holdingView.amount
+        assertMsg "Stake amount must be positive." $ stakeAmount > 0.0
+        assertMsg "Holding instrument must match the stake pool's token." $ holdingView.instrument == token
+        assertMsg "Holding owner must be the delegator." $ holdingView.owner == delegator
 
-        pool <- fetch poolCid
-        updatedPoolCid <- exercise poolCid UpdateRewardState
-        updatedPool <- fetch updatedPoolCid
+        -- Transfer tokens from the delegator to the pool operator.
+        exercise ghover holdingCid Transferable.F.Transfer with newOwner = operator
 
-        -- NOTE: Users should ideally exercise ClaimRewards before unbonding. Any pending rewards
-        -- on the unbonding amount are effectively forfeited in this simplified model. A more
-        -- complex implementation could create a reward payout here.
+        -- If the delegator already has a stake, calculate and pay out their pending rewards first.
+        let pending = calculatePending delegator
+        when (pending > 0.0) do
+          exercise holdingFactoryCid HoldingFactory.F.Create
+            with instrument = token; owner = delegator; amount = pending
 
-        let remainingAmount = amount - unbondAmount
-        archive self
-        when (remainingAmount > 0.0) do
-          create this with
-            amount = remainingAmount,
-            poolCid = updatedPoolCid,
-            rewardDebt = updatedPool.accumulatedRewardPerToken
+        -- Update the delegator's state.
+        let currentDelegation = fromMaybe (Delegation 0.0 rewardsPerUnitStaked) (Map.lookup delegator delegations)
+        let newDelegation = Delegation with
+              amount = currentDelegation.amount + stakeAmount
+              rewardDebt = rewardsPerUnitStaked -- Update debt to current rate
+        let newDelegations = Map.insert delegator newDelegation delegations
+        let newTotalStaked = totalStaked + stakeAmount
 
-        let newTotalStaked = updatedPool.totalStaked - unbondAmount
-        let newDelegators = if remainingAmount <= 0.0 then
-                              Set.delete delegator updatedPool.delegators
-                            else
-                              updatedPool.delegators
-        archive updatedPoolCid
-        create updatedPool with
-          totalStaked = newTotalStaked,
-          delegators = newDelegators
-
-        now <- getTime
-        today <- date now
-        let completionDate = addDays today (unbondingPeriodDays updatedPool)
-
-        create UnbondingDelegation with validator, delegator, amount = unbondAmount, completionDate
-
-    choice ClaimRewards: ContractId Payout
-      controller delegator
-      do
-        pool <- fetch poolCid
-        updatedPoolCid <- exercise poolCid UpdateRewardState
-        updatedPool <- fetch updatedPoolCid
-
-        let pendingRewards = amount * (updatedPool.accumulatedRewardPerToken - rewardDebt)
-        assertMsg "No rewards to claim." (pendingRewards > 0.0)
-
-        -- Recreate the delegation with an updated rewardDebt to "reset" the reward counter.
-        archive self
         create this with
-          poolCid = updatedPoolCid,
-          rewardDebt = updatedPool.accumulatedRewardPerToken
+          delegations = newDelegations
+          totalStaked = newTotalStaked
 
-        create Payout with payer = validator, receiver = delegator, assetSymbol = updatedPool.assetSymbol, amount = pendingRewards
-
--- Represents a stake that is in the cooldown period after unbonding.
-template UnbondingDelegation
-  with
-    validator: Party
-    delegator: Party
-    amount: Decimal
-    completionDate: Date
-  where
-    signatory validator, delegator
-
-    choice Withdraw: ContractId WithdrawalReceipt
+    -- | A delegator initiates the process to unstake some or all of their tokens.
+    -- | Pending rewards are paid out, and an `UnbondingTicket` is created which allows
+    -- | them to reclaim their tokens after the `unbondingPeriodDays`.
+    choice Unbond : (ContractId StakePool, ContractId UnbondingTicket)
+      with
+        delegator : Party
+        amountToUnbond : Decimal
       controller delegator
       do
+        let currentDelegation = fromSomeNote ("Delegator not found: " <> show delegator) (Map.lookup delegator delegations)
+        assertMsg "Unbond amount must be positive." $ amountToUnbond > 0.0
+        assertMsg "Cannot unbond more than the staked amount." $ amountToUnbond <= currentDelegation.amount
+
+        -- Calculate and pay out any pending rewards before changing the stake amount.
+        let pending = calculatePending delegator
+        when (pending > 0.0) do
+          exercise holdingFactoryCid HoldingFactory.F.Create
+            with instrument = token; owner = delegator; amount = pending
+
+        -- Update the pool's state to reflect the unbonding.
+        let newAmount = currentDelegation.amount - amountToUnbond
+        let newDelegations =
+              if newAmount > 0.0 then
+                -- Delegator still has stake remaining, update their delegation.
+                let newDelegation = Delegation with amount = newAmount, rewardDebt = rewardsPerUnitStaked
+                in Map.insert delegator newDelegation delegations
+              else
+                -- Delegator has unbonded their entire stake, remove them from the map.
+                Map.delete delegator delegations
+
+        let newTotalStaked = totalStaked - amountToUnbond
+
+        poolCid <- create this with
+          delegations = newDelegations
+          totalStaked = newTotalStaked
+
+        -- Create the unbonding ticket for the delegator.
         now <- getTime
-        today <- date now
-        assertMsg ("Withdrawal not yet available. Completion date: " <> show completionDate) (today >= completionDate)
+        let unbondingCompleteTime = addRelTime now (days (fromInteger $ intToInteger unbondingPeriodDays))
+        ticketCid <- create UnbondingTicket with
+          operator
+          delegator
+          token
+          amount = amountToUnbond
+          unbondingCompleteTime
+          holdingFactoryCid
 
-        archive self
-        pool <- fetchbyKey @StakePool validator
-        create WithdrawalReceipt with validator, delegator, assetSymbol = pool.assetSymbol, amount, timestamp = now
+        return (poolCid, ticketCid)
 
--- A receipt confirming a successful withdrawal of unbonded stake.
-template WithdrawalReceipt
-  with
-    validator: Party
-    delegator: Party
-    assetSymbol: Text
-    amount: Decimal
-    timestamp: Time
-  where
-    signatory validator, delegator
-
--- A contract representing a claimable amount of rewards.
-template Payout
-  with
-    payer: Party
-    receiver: Party
-    assetSymbol: Text
-    amount: Decimal
-  where
-    signatory payer
-    observer receiver
-
-    choice Acknowledge: ()
-      controller receiver
+    -- | A delegator claims their accrued rewards without changing their staked amount.
+    choice ClaimRewards : ContractId StakePool
+      with
+        delegator : Party
+      controller delegator
       do
-        -- In a real system, this would be archived upon fulfillment by a token contract.
-        archive self
+        let pending = calculatePending delegator
+        assertMsg "No rewards to claim." $ pending > 0.0
+
+        -- Create a new holding for the delegator with the claimed reward amount.
+        exercise holdingFactoryCid HoldingFactory.F.Create
+          with instrument = token; owner = delegator; amount = pending
+
+        -- Update the delegator's reward debt to the current pool rate to prevent double-claiming.
+        let currentDelegation = fromSomeNote ("Delegator not found: " <> show delegator) (Map.lookup delegator delegations)
+        let newDelegation = currentDelegation with rewardDebt = rewardsPerUnitStaked
+        let newDelegations = Map.insert delegator newDelegation delegations
+
+        create this with delegations = newDelegations
+
+    -- | The pool operator adds rewards to the pool, which are then available to be
+    -- | claimed by delegators proportional to their stake.
+    choice DistributeRewards : ContractId StakePool
+      with
+        rewardHoldingCid : ContractId Fungible.I
+          -- ^ A holding of tokens to be distributed as rewards.
+      controller operator
+      do
+        assertMsg "Cannot distribute rewards to an empty pool (totalStaked is zero)." $ totalStaked > 0.0
+
+        rewardHoldingView <- view ghover rewardHoldingCid
+        let rewardAmount = rewardHoldingView.amount
+        assertMsg "Reward amount must be positive." $ rewardAmount > 0.0
+        assertMsg "Reward instrument must match the stake pool's token." $ rewardHoldingView.instrument == token
+
+        -- Ensure the reward tokens are owned by the operator before distribution.
+        when (rewardHoldingView.owner /= operator) do
+          exercise ghover rewardHoldingCid Transferable.F.Transfer with newOwner = operator
+
+        -- Update the pool's reward rate.
+        let newRewardsPerUnit = rewardAmount / totalStaked
+        let newRewardsPerUnitStaked = rewardsPerUnitStaked + newRewardsPerUnit
+        now <- getTime
+
+        create this with
+          rewardsPerUnitStaked = newRewardsPerUnitStaked
+          lastRewardUpdateTime = now
+
+    -- | Non-consuming choice for any stakeholder to view a specific delegator's position.
+    nonconsuming choice ViewDelegation : Optional Delegation
+      with
+        party: Party
+      controller party, operator
+      do
+        return $ Map.lookup party delegations
