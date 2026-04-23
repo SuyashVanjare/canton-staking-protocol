@@ -1,127 +1,235 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
 # ==============================================================================
-# Create Validator Stake Pool Script
-# ==============================================================================
+# Creates a new validator staking pool on the ledger.
 #
-# Description:
-#   This script registers a new validator stake pool on the Canton network by
-#   sending a `create` command for the `StakePool` template to the JSON API.
-#
-# Prerequisites:
-#   - `curl`: To send HTTP requests.
-#   - `jq`: To parse and pretty-print JSON responses.
-#   - A running Canton network with the JSON API enabled.
-#   - The canton-staking-protocol.dar must be uploaded to the participant node.
+# This script exercises the `CreateValidatorPool` choice on the central
+# `Staking.Factory:Factory` contract. It can either take the factory contract
+# ID directly or query for it if the factory owner's party ID is provided.
 #
 # Usage:
-#   1. Configure the variables in the "Configuration" section below.
-#   2. Make the script executable: `chmod +x scripts/create-pool.sh`
-#   3. Run the script: `./scripts/create-pool.sh`
+#   ./scripts/create-pool.sh \
+#     --factory-cid <FACTORY_CONTRACT_ID> \
+#     --operator <VALIDATOR_PARTY_ID> \
+#     --operator-name "My Validator" \
+#     --commission 0.05 \
+#     --min-delegation 10000.0 \
+#     --stake-token-tid "pkgid:Module:Entity"
 #
+# Alternate usage (auto-discover factory contract):
+#   ./scripts/create-pool.sh \
+#     --factory-owner <FACTORY_OWNER_PARTY_ID> \
+#     --operator <VALIDATOR_PARTY_ID> \
+#     --operator-name "My Validator" \
+#     # ... other args
+#
+# Arguments:
+#   --factory-cid      (Optional) The contract ID of the Staking.Factory:Factory contract.
+#   --factory-owner    (Optional) The party ID of the factory owner. Used to find the factory if --factory-cid is not given.
+#   --operator         (Required) The party ID of the validator operator.
+#   --operator-name    (Required) The human-readable name of the pool.
+#   --commission       (Required) The commission rate on rewards (e.g., 0.05 for 5%).
+#   --min-delegation   (Required) The minimum required self-delegation amount.
+#   --stake-token-tid  (Required) The full template ID of the stakeable token, in format 'package_id:ModuleName:EntityName'.
+#   --host             (Optional) The ledger host. Default: localhost.
+#   --port             (Optional) The JSON API port. Default: 7575.
+#   --token-file       (Optional) Path to a JSON file mapping party IDs to JWTs. Default: build/user-tokens.json.
 # ==============================================================================
 
-# --- Configuration ---
-# Adjust these variables to match your Canton environment and desired pool settings.
+set -euo pipefail
 
-# The URL of the Canton JSON API endpoint.
-JSON_API_URL="http://localhost:7575"
+# --- Defaults ---
+LEDGER_HOST="localhost"
+LEDGER_PORT="7575"
+TOKEN_FILE_PATH="build/user-tokens.json"
+FACTORY_CID=""
+FACTORY_OWNER=""
 
-# The Ledger Party ID of the validator creating the pool.
-# This party must be hosted on the participant node connected to the JSON API.
-VALIDATOR="validator::1220a514400a0684d56126b8b0e897e9c5f61d56f5a3a7c669f9250f162095c10526"
+# --- Argument Parsing ---
+while [[ $# -gt 0 ]]; do
+  key="$1"
+  case $key in
+    --factory-cid)
+      FACTORY_CID="$2"
+      shift 2
+      ;;
+    --factory-owner)
+      FACTORY_OWNER="$2"
+      shift 2
+      ;;
+    --operator)
+      OPERATOR_PARTY_ID="$2"
+      shift 2
+      ;;
+    --operator-name)
+      OPERATOR_NAME="$2"
+      shift 2
+      ;;
+    --commission)
+      COMMISSION_RATE="$2"
+      shift 2
+      ;;
+    --min-delegation)
+      MIN_DELEGATION="$2"
+      shift 2
+      ;;
+    --stake-token-tid)
+      STAKE_TOKEN_TID="$2"
+      shift 2
+      ;;
+    --host)
+      LEDGER_HOST="$2"
+      shift 2
+      ;;
+    --port)
+      LEDGER_PORT="$2"
+      shift 2
+      ;;
+    --token-file)
+      TOKEN_FILE_PATH="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1"
+      exit 1
+      ;;
+  esac
+done
 
-# The Ledger Party ID of the pool operator. This can be the same as the validator.
-OPERATOR="$VALIDATOR"
-
-# A unique text identifier for the new staking pool.
-POOL_ID="ValiantValidatorPool-01"
-
-# The identifier for the asset/token being staked (e.g., a contract ID or a unique name).
-STAKE_TOKEN_ASSET="CantonCoin"
-
-# The commission rate the validator charges on rewards (e.g., "0.05" for 5%).
-COMMISSION_RATE="0.05"
-
-# The minimum amount of the stake token the validator must delegate to their own pool.
-MIN_SELF_DELEGATION="1000.0"
-
-# --- Authentication ---
-# For local testing, we generate a simple, unsigned JWT.
-# In a production environment, use a secure, signed token from your identity provider.
-# The payload identifies the ledger and the party making the request (`actAs`).
-LEDGER_ID="my-ledger" # Should match your ledger's ID
-APPLICATION_ID="canton-staking-protocol" # Can be any identifier
-PAYLOAD="{\"https://daml.com/ledger-api\": {\"ledgerId\": \"$LEDGER_ID\", \"applicationId\": \"$APPLICATION_ID\", \"actAs\": [\"$VALIDATOR\"]}}"
-
-# Base64-encode the payload to create the token.
-# Use -w0 on Linux, or `tr -d '\n'` on macOS for a single line output.
-if [[ "$(uname)" == "Darwin" ]]; then
-  JWT_TOKEN=$(echo -n "$PAYLOAD" | base64 | tr -d '\n')
-else
-  JWT_TOKEN=$(echo -n "$PAYLOAD" | base64 -w0)
+# --- Validation ---
+if [ -z "${OPERATOR_PARTY_ID-}" ] || \
+   [ -z "${OPERATOR_NAME-}" ] || \
+   [ -z "${COMMISSION_RATE-}" ] || \
+   [ -z "${MIN_DELEGATION-}" ] || \
+   [ -z "${STAKE_TOKEN_TID-}" ]; then
+  echo "Error: Missing required arguments: --operator, --operator-name, --commission, --min-delegation, --stake-token-tid"
+  exit 1
 fi
 
+if [ -z "$FACTORY_CID" ] && [ -z "$FACTORY_OWNER" ]; then
+  echo "Error: Must provide either --factory-cid or --factory-owner to locate the factory contract."
+  exit 1
+fi
 
-# --- Script Logic ---
-echo "▶️  Preparing to create StakePool for Validator: $VALIDATOR"
-echo "    - Pool ID:          $POOL_ID"
-echo "    - Operator:         $OPERATOR"
-echo "    - Commission:       $COMMISSION_RATE"
-echo "    - Min Self-Stake:   $MIN_SELF_DELEGATION"
-echo ""
+# --- Helper Functions ---
+function get_party_token() {
+  local party_id="$1"
 
-# Get the current time in ISO 8601 format for the `lastRewardTime` field.
-CURRENT_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  if [ ! -f "$TOKEN_FILE_PATH" ]; then
+    echo "Error: Token file not found at '$TOKEN_FILE_PATH'."
+    echo "Please specify a valid path with --token-file or create the default file."
+    exit 1
+  fi
 
-# The templateId is specified as `Module:Template`. The JSON API resolves the package ID.
-# Based on the project structure, the module is `StakePool`.
-TEMPLATE_ID="StakePool:StakePool"
+  # Extracts the JWT for the given party ID from a file with format: {"partyId": "jwt", ...}
+  local token=$(jq -r --arg party "$party_id" '.[$party]' "$TOKEN_FILE_PATH")
 
-# Construct the JSON payload for the create command.
-# The `delegators` field is a DA.Map, represented as a JSON object. We start with an empty map.
-# `totalStaked` and `slashed` are initialized to their default starting values.
-CREATE_PAYLOAD=$(cat <<EOF
+  if [ -z "$token" ] || [ "$token" == "null" ]; then
+    echo "Error: Could not find a token for party '$party_id' in '$TOKEN_FILE_PATH'."
+    exit 1
+  fi
+
+  echo "$token"
+}
+
+# --- Main Logic ---
+
+# 1. Get Authentication Token for the operator (the controller of the choice)
+echo "Getting JWT for operator '$OPERATOR_PARTY_ID'..."
+OPERATOR_TOKEN=$(get_party_token "$OPERATOR_PARTY_ID")
+echo "Successfully obtained JWT for operator."
+
+# 2. Find the main package ID from the project's DAR file
+echo "Locating project DAR file..."
+DAR_FILE=$(find .daml/dist -name "canton-staking-protocol-*.dar" | head -n 1)
+if [ -z "$DAR_FILE" ]; then
+    echo "Error: Could not find project DAR file in .daml/dist/. Please run 'dpm build' first."
+    exit 1
+fi
+echo "Using DAR file: $DAR_FILE"
+MAIN_PKG_ID=$(dpm damlc inspect-dar --json "$DAR_FILE" | jq -r .main_package_id)
+echo "Project main package ID: $MAIN_PKG_ID"
+
+# 3. Find Factory Contract ID if not provided
+if [ -z "$FACTORY_CID" ]; then
+  echo "Factory CID not provided. Querying for factory contract owned by '$FACTORY_OWNER'..."
+  FACTORY_OWNER_TOKEN=$(get_party_token "$FACTORY_OWNER")
+
+  QUERY_PAYLOAD=$(printf '{ "templateIds": ["%s:Staking.Factory:Factory"] }' "$MAIN_PKG_ID")
+
+  API_URL="http://${LEDGER_HOST}:${LEDGER_PORT}/v1/query"
+  QUERY_RESPONSE=$(curl --silent --show-error -X POST "$API_URL" \
+    -H "Authorization: Bearer $FACTORY_OWNER_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$QUERY_PAYLOAD")
+
+  # Assuming there's only one factory contract for this owner
+  FACTORY_CID=$(echo "$QUERY_RESPONSE" | jq -r '.result[0].contractId')
+
+  if [ -z "$FACTORY_CID" ] || [ "$FACTORY_CID" == "null" ]; then
+    echo "Error: Could not find an active Staking.Factory:Factory contract for owner '$FACTORY_OWNER'."
+    echo "Response from query: $QUERY_RESPONSE"
+    exit 1
+  fi
+  echo "Found factory contract with CID: $FACTORY_CID"
+fi
+
+# 4. Construct JSON Payload
+IFS=':' read -r TOKEN_PKG_ID TOKEN_MODULE TOKEN_ENTITY <<< "$STAKE_TOKEN_TID"
+if [ -z "$TOKEN_PKG_ID" ] || [ -z "$TOKEN_MODULE" ] || [ -z "$TOKEN_ENTITY" ]; then
+  echo "Error: --stake-token-tid must be in the format 'package_id:ModuleName:EntityName'."
+  exit 1
+fi
+
+JSON_PAYLOAD=$(cat <<EOF
 {
-  "templateId": "$TEMPLATE_ID",
-  "payload": {
-    "validator": "$VALIDATOR",
-    "operator": "$OPERATOR",
-    "poolId": "$POOL_ID",
-    "stakeToken": "$STAKE_TOKEN_ASSET",
+  "templateId": {
+    "packageId": "$MAIN_PKG_ID",
+    "moduleName": "Staking.Factory",
+    "entityName": "Factory"
+  },
+  "contractId": "$FACTORY_CID",
+  "choice": "CreateValidatorPool",
+  "argument": {
+    "operator": "$OPERATOR_PARTY_ID",
+    "operatorName": "$OPERATOR_NAME",
+    "stakeToken": {
+      "packageId": "$TOKEN_PKG_ID",
+      "moduleName": "$TOKEN_MODULE",
+      "entityName": "$TOKEN_ENTITY"
+    },
     "commissionRate": "$COMMISSION_RATE",
-    "minSelfDelegation": "$MIN_SELF_DELEGATION",
-    "totalStaked": "0.0",
-    "delegators": {},
-    "slashed": false,
-    "lastRewardTime": "$CURRENT_TIME"
+    "minSelfDelegation": "$MIN_DELEGATION"
   }
 }
 EOF
 )
 
-echo "▶️  Sending create command to JSON API..."
-# Use curl to send the POST request to the /v1/create endpoint.
-# The -s flag silences progress output.
-# The response is piped to jq for pretty-printing.
-HTTP_RESPONSE=$(curl -s -w "%{http_code}" -X POST "$JSON_API_URL/v1/create" \
-  -H "Authorization: Bearer $JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "$CREATE_PAYLOAD")
+# 5. Send Request to JSON API
+API_URL="http://${LEDGER_HOST}:${LEDGER_PORT}/v1/exercise"
+echo "Submitting command to create validator pool..."
+echo "URL: $API_URL"
+echo "Payload:"
+echo "$JSON_PAYLOAD" | jq .
 
-# Extract the body and the status code
-HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed '$d')
-HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tail -n1)
+HTTP_RESPONSE=$(curl --silent --show-error --location --request POST "$API_URL" \
+--header "Authorization: Bearer $OPERATOR_TOKEN" \
+--header 'Content-Type: application/json' \
+--data-raw "$JSON_PAYLOAD" \
+--write-out "HTTP_STATUS:%{http_code}")
 
+# 6. Process Response
+HTTP_BODY=$(echo "$HTTP_RESPONSE" | sed -e 's/HTTP_STATUS:.*//g')
+HTTP_STATUS=$(echo "$HTTP_RESPONSE" | tr -d '\n' | sed -e 's/.*HTTP_STATUS://')
 
-echo "◀️  Received response (HTTP Status: $HTTP_STATUS):"
-if [[ $HTTP_STATUS -ge 200 && $HTTP_STATUS -lt 300 ]]; then
+if [ "$HTTP_STATUS" -eq 200 ]; then
+  echo "Successfully created validator pool!"
+  echo "Response:"
   echo "$HTTP_BODY" | jq .
-  echo ""
-  echo "✅  StakePool creation command submitted successfully."
+  exit 0
 else
-  echo "❌  Error: Failed to create StakePool."
+  echo "Error: Failed to create validator pool. HTTP Status: $HTTP_STATUS"
+  echo "Response:"
   echo "$HTTP_BODY" | jq .
   exit 1
 fi
