@@ -1,162 +1,214 @@
--- |
 -- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
 -- SPDX-License-Identifier: Apache-2.0
---
 
-module RewardAccrual where
+module Staking.RewardAccrual where
 
-import DA.Time (Time, RelTime, addRelTime, fromRelTime)
-import DA.Numeric (Numeric, intToNumeric)
-import DA.Assert (assert, assertMsg)
-import DA.Optional (Optional(..))
-import DA.Foldable (forA_)
-import Control.Applicative (when)
+import Daml.Script
 
--- These imports are assumed to exist from other files in the project.
-import StakePool (StakePool)
-import Delegation (Delegation(..))
+import Daml.Finance.Interface.Types.Common.Types (InstrumentKey)
 
--- | Defines the reward parameters and distribution schedule for a stake pool.
--- This contract is managed by the validator and serves as the engine for
--- reward calculations for a specific pool.
-template RewardSchedule
+import Staking.Types (ValidatorConfig, Delegation)
+
+import DA.Time (Time, diffRelTime, addRelTime)
+import DA.Assert (assertMsg)
+import DA.Math ((/))
+
+-- | Encapsulates the state required for reward calculations for a validator's staking pool.
+-- This approach, using a cumulative reward index, is highly scalable as it avoids iterating
+-- over all delegators to distribute rewards. Instead, reward calculations are done on-demand
+-- when a delegator interacts with their stake (e.g., claims rewards or unstakes).
+data RewardState = RewardState
+  with
+    lastAccrualTime : Time
+    -- ^ The timestamp of the last time rewards were calculated and compounded for this pool.
+    rewardIndex : Decimal
+    -- ^ A cumulative index representing total rewards distributed per unit of stake since inception.
+    -- It is initialized to 1.0 and increases monotonically.
+    -- A delegator's total claimable stake is `initialStake * (currentIndex / indexAtTimeOfStake)`.
+  deriving (Eq, Show)
+
+-- | Represents the live reward accrual state for a single validator's staking pool.
+-- There should be one instance of this contract per validator per staked token type.
+-- The 'operator' party is responsible for periodically calling 'AccrueRewards' to keep
+-- the reward index up-to-date. This is typically automated by an off-ledger service.
+template ValidatorRewardState
   with
     validator : Party
-    stakePoolCid : ContractId StakePool
-    -- | Annual Percentage Rate (APR) expressed as a decimal (e.g., 0.05 for 5%).
-    annualPercentageRate : Numeric 10
-    -- | The duration of a single reward epoch.
-    epochDuration : RelTime
-    -- | The number of the last epoch for which rewards were successfully distributed.
-    lastProcessedEpochNumber : Int
-    -- | The timestamp marking the end of the last processed epoch. This is the
-    -- | start time for the next epoch.
-    lastProcessedTime : Time
+    -- ^ The party identity of the validator node.
+    operator : Party
+    -- ^ The party authorized to trigger reward accruals for this validator.
+    token : InstrumentKey
+    -- ^ The instrument being staked in this pool.
+    totalStaked : Decimal
+    -- ^ The total amount of tokens staked in this pool, including all auto-compounded rewards
+    -- distributed to delegators.
+    rewardState : RewardState
+    -- ^ The current reward calculation state.
+    configCid : ContractId ValidatorConfig
+    -- ^ A contract ID pointing to the validator's configuration, which includes parameters
+    -- like the Annual Percentage Rate (APR) and commission.
   where
     signatory validator
+    observer operator
 
-    key (validator, stakePoolCid) : (Party, ContractId StakePool)
+    key (validator, token) : (Party, InstrumentKey)
     maintainer key._1
 
-    -- | Helper to calculate the total rewards for a single epoch based on the total
-    -- amount staked in the pool.
-    let calculateEpochReward (totalStaked : Numeric 10) : Numeric 10 =
-          -- Formula: (TotalStaked * APR) * (EpochDurationInSeconds / SecondsInYear)
-          let secondsInYear = 31536000.0 -- 365 * 24 * 60 * 60
-          let epochDurationInSeconds = intToNumeric $ truncate $ fromRelTime epochDuration
-          let annualInterest = totalStaked * annualPercentageRate
-          annualInterest * epochDurationInSeconds / secondsInYear
+    ensure
+      totalStaked > 0.0
+      && rewardState.rewardIndex >= 1.0
 
-    -- | Allows the validator to update the reward rate for future epochs.
-    choice UpdateRate : ContractId RewardSchedule
+    -- | Calculates and compounds staking rewards for the period since the last accrual.
+    -- This choice should be called periodically (e.g., once per epoch) by the operator to
+    -- ensure the reward index reflects the latest earnings.
+    choice AccrueRewards : ContractId ValidatorRewardState
       with
-        newApr : Numeric 10
-      controller validator
-      do
-        assertMsg "New APR must be non-negative" (newApr >= 0.0)
-        create this with annualPercentageRate = newApr
-
-    -- | Processes rewards for the next epoch. This choice is intended to be
-    -- | called by an automated process (e.g., a Daml Trigger or Canton Domain Service)
-    -- | after an epoch has concluded. It calculates the total rewards for the epoch and
-    -- | distributes them proportionally to all active delegations.
-    choice DistributeNextEpochRewards : ContractId RewardSchedule
-      with
-        -- | A list of all active delegations for this pool. This is passed in
-        -- | to avoid an unbounded fetch within the transaction, which is a Daml best practice.
-        delegationCids : [ContractId Delegation]
         currentTime : Time
-      controller validator
+        -- ^ The current time, used to determine the duration for reward calculation.
+      controller operator
       do
-        let nextEpochNumber = lastProcessedEpochNumber + 1
-        let nextEpochStartTime = lastProcessedTime
-        let nextEpochEndTime = addRelTime nextEpochStartTime epochDuration
+        config <- fetch configCid
 
-        -- Ensure we are processing the epoch only after it has completed.
-        assertMsg "Cannot distribute rewards before epoch ends" (currentTime >= nextEpochEndTime)
+        let timeSinceLastAccrual = diffRelTime currentTime rewardState.lastAccrualTime
+        assertMsg "Cannot accrue rewards for the future." $ timeSinceLastAccrual >= 0.0
+        assertMsg "Cannot accrue rewards for zero duration." $ timeSinceLastAccrual > 0.0
 
-        pool <- fetch stakePoolCid
-        assertMsg "Stake pool contract's validator does not match this schedule's validator" (pool.validator == validator)
+        -- Calculate rewards for the elapsed period using a simple interest formula.
+        -- Interest = Principal * Rate * Time. Time is expressed in years.
+        let secondsPerYear = 365.25 * 24.0 * 60.0 * 60.0
+        let timeDeltaYears = timeSinceLastAccrual / secondsPerYear
+        let grossRewards = totalStaked * config.apr * timeDeltaYears
 
-        -- Only distribute rewards if there is stake in the pool.
-        when (pool.totalStaked > 0.0) do
-          -- Calculate total rewards for this epoch
-          let totalEpochRewards = calculateEpochReward pool.totalStaked
+        -- The validator's commission is taken from the gross rewards.
+        let validatorCommission = grossRewards * config.commissionRate
+        let delegatorRewards = grossRewards - validatorCommission
 
-          -- Distribute rewards proportionally to each delegation
-          forA_ delegationCids (\delegationCid -> do
-            delegation <- fetch delegationCid
-            -- Ensure the delegation belongs to this validator (and thus this pool)
-            assert (delegation.validator == validator)
+        -- If no rewards are distributable to delegators, only update the accrual timestamp.
+        if delegatorRewards <= 0.0 then do
+          let newRewardState = rewardState with lastAccrualTime = currentTime
+          create this with rewardState = newRewardState
+        else do
+          -- Add the delegator rewards to the total staked amount. This is the auto-compounding step.
+          let newTotalStaked = totalStaked + delegatorRewards
+          assertMsg "Total staked amount must not decrease during accrual" $ newTotalStaked >= totalStaked
 
-            let delegatorShare = delegation.stakedAmount / pool.totalStaked
-            let rewardAmount = totalEpochRewards * delegatorShare
+          -- The growth factor represents the percentage increase in stake for this period.
+          let growthFactor = newTotalStaked / totalStaked
 
-            -- If there's a non-zero reward, find or create the AccruedRewards contract
-            -- and add the reward.
-            when (rewardAmount > 0.0) do
-              mRewardCid <- lookupByKey @AccruedRewards (delegation.delegator, delegationCid)
-              case mRewardCid of
-                Some rewardCid ->
-                  exercise rewardCid AddReward with newRewardAmount = rewardAmount
-                None ->
-                  create AccruedRewards with
-                    delegator = delegation.delegator
-                    validator
-                    delegationCid
-                    accruedAmount = rewardAmount
-            )
+          -- Update the reward index by the growth factor.
+          let newRewardIndex = rewardState.rewardIndex * growthFactor
 
-        -- Create the next version of the schedule, marking this epoch as processed.
-        create this with
-          lastProcessedEpochNumber = nextEpochNumber
-          lastProcessedTime = nextEpochEndTime
+          let newRewardState = RewardState with
+                lastAccrualTime = currentTime
+                rewardIndex = newRewardIndex
 
+          -- Recreate the contract with the updated, compounded state.
+          create this with
+            totalStaked = newTotalStaked
+            rewardState = newRewardState
 
--- | Tracks the rewards accrued by a single delegator for a specific delegation contract.
--- This allows rewards to be managed separately from the core stake and enables
--- features like compounding or separate claiming.
-template AccruedRewards
-  with
-    delegator : Party
-    validator : Party
-    delegationCid : ContractId Delegation
-    accruedAmount : Numeric 10
-  where
-    signatory validator
-    observer delegator
+-- | A pure helper function to calculate the amount of unclaimed rewards for a specific delegation.
+-- It can be called from other modules without needing to exercise a choice, allowing for
+-- off-ledger queries or use within other contract logic.
+calculateUnclaimedRewards: Delegation -> ValidatorRewardState -> Decimal
+calculateUnclaimedRewards delegation rewardPool =
+  let
+    -- The principal amount of the delegation, as of the last update.
+    stakedAmount = delegation.amount
 
-    key (delegator, delegationCid) : (Party, ContractId Delegation)
-    maintainer key._1
+    -- The reward index of the pool when this delegation was last updated (e.g., created,
+    -- rewards claimed, or more stake added).
+    indexAtLastUpdate = delegation.rewardIndexAtLastUpdate
 
-    ensure accruedAmount > 0.0
+    -- The current reward index of the pool.
+    currentIndex = rewardPool.rewardState.rewardIndex
 
-    -- | Internal choice for the validator to add rewards during distribution.
-    choice AddReward : ContractId AccruedRewards
-      with
-        newRewardAmount : Numeric 10
-      controller validator
-      do
-        assertMsg "Reward amount must be positive" (newRewardAmount > 0.0)
-        create this with accruedAmount = accruedAmount + newRewardAmount
+    -- The user's current holdings are their initial amount grown by the ratio of reward indices.
+    -- An assertion ensures indexAtLastUpdate is not zero. It's initialized to >= 1.0.
+    assertMsg "Reward index at last update must be positive." $ indexAtLastUpdate > 0.0
+    currentHoldings = stakedAmount * (currentIndex / indexAtLastUpdate)
 
-    -- | Choice for the delegator to claim their rewards. In a real-world
-    -- | scenario, this would trigger a token transfer workflow. For simplicity,
-    -- | this choice archives the contract and returns the amount to be paid out.
-    choice ClaimRewards : Numeric 10
-      controller delegator
-      do
-        archive self
-        return accruedAmount
+    -- Unclaimed rewards are the difference between their current total holdings and their
+    -- principal stake.
+    unclaimed = currentHoldings - stakedAmount
+  in
+    -- Sanity check to prevent negative rewards due to floating-point arithmetic noise.
+    if unclaimed > 0.0 then unclaimed else 0.0
 
-    -- | Choice for the delegator to compound (re-stake) their accrued rewards.
-    -- | This increases the principal of their original delegation.
-    choice CompoundRewards : ContractId Delegation
-      controller delegator
-      do
-        -- This choice assumes the `Delegation` template has an `AddStake` choice
-        -- that allows increasing the staked amount.
-        -- e.g., choice AddStake : ContractId Delegation with additionalAmount: Numeric 10
-        newDelegationCid <- exercise delegationCid AddStake with additionalAmount = accruedAmount
-        archive self
-        return newDelegationCid
+-- | Daml Script tests for the reward accrual logic.
+module Staking.RewardAccrual.Test where
+
+import Staking.RewardAccrual
+import Staking.Test.Util (setupPartiesAndToken)
+import Staking.Types
+
+testRewardAccrualLogic : Script ()
+testRewardAccrualLogic = script do
+  -- 1. SETUP
+  (validator, operator, delegator, token) <- setupPartiesAndToken
+  let now = time (DA.Date.date 2024 1 1) 0 0 0
+  let oneYearLater = addRelTime now (365.0 * 24.0 * 60.0 * 60.0)
+
+  let config = ValidatorConfig with
+        validator
+        operator
+        token
+        minSelfDelegation = 1000.0
+        commissionRate = 0.05 -- 5%
+        maxCommissionRateChange = 0.01
+        unbondingPeriodSeconds = 21 * 24 * 60 * 60 -- 21 days
+        apr = 0.10 -- 10% APR
+  configCid <- submit validator do create config
+
+  let initialStaked = 1_000_000.0
+  let initialState = RewardState with lastAccrualTime = now, rewardIndex = 1.0
+
+  initialStateCid <- submit validator do
+    create ValidatorRewardState with
+      validator
+      operator
+      token
+      totalStaked = initialStaked
+      rewardState = initialState
+      configCid
+
+  -- 2. ACCRUE REWARDS OVER ONE YEAR
+  accruedStateCid <- submit operator do
+    exercise initialStateCid AccrueRewards with currentTime = oneYearLater
+
+  -- 3. VERIFY NEW STATE
+  accruedState <- fetch accruedStateCid
+  accruedState.rewardState.lastAccrualTime === oneYearLater
+
+  -- Expected rewards after 1 year at 10% APR on 1M staked
+  let expectedGrossRewards = initialStaked * 0.10
+  -- Validator takes 5% commission
+  let expectedCommission = expectedGrossRewards * 0.05
+  -- Net rewards distributed to delegators
+  let expectedDelegatorRewards = expectedGrossRewards - expectedCommission -- 95,000.0
+  -- Total staked amount is compounded
+  let expectedTotalStaked = initialStaked + expectedDelegatorRewards -- 1,095,000.0
+
+  -- Verify total staked amount
+  assert (abs (accruedState.totalStaked - expectedTotalStaked) < 1e-9)
+
+  -- Verify reward index
+  let expectedRewardIndex = 1.0 * (expectedTotalStaked / initialStaked) -- 1.095
+  assert (abs (accruedState.rewardState.rewardIndex - expectedRewardIndex) < 1e-9)
+
+  -- 4. TEST `calculateUnclaimedRewards` HELPER
+  let delegation = Delegation with
+        delegator
+        validator
+        token
+        amount = 10_000.0
+        -- This delegation was made at the beginning when the index was 1.0
+        rewardIndexAtLastUpdate = 1.0
+
+  let unclaimed = calculateUnclaimedRewards delegation accruedState
+
+  -- Expected rewards for this delegator: 10,000 * 10% APR * (1 - 5% commission) = 950.0
+  let expectedUnclaimed = delegation.amount * config.apr * (1.0 - config.commissionRate)
+  assert (abs (unclaimed - expectedUnclaimed) < 1e-9)
+
+  debug "Reward accrual and calculation tests passed successfully."
