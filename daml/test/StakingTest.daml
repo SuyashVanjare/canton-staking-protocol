@@ -1,205 +1,255 @@
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
 module StakingTest where
 
 import Daml.Script
-import DA.Date
-import DA.Time
-import DA.Assert ((===))
-import DA.Optional (isNone)
+import DA.Assert
+import DA.Date as D
+import DA.Time as T
 
--- Assuming these modules exist based on the project file structure.
--- The test assumes specific template names and choice signatures from these modules.
-import StakePool
-import Delegation
-import RewardAccrual
+import Staking
+import Unbonding
 
--- Test Suite for the Staking Protocol
+-- | A minimal IOU template for testing purposes.
+template Iou
+  with
+    issuer : Party
+    owner : Party
+    asset : Text
+    amount : Decimal
+  where
+    signatory issuer, owner
+
+    nonconsuming choice Split : (ContractId Iou, ContractId Iou)
+      controller owner
+      with
+        splitAmount: Decimal
+      do
+        assertMsg "Split amount must be positive" (splitAmount > 0.0)
+        assertMsg "Split amount cannot exceed total amount" (splitAmount <= amount)
+        let remainingAmount = amount - splitAmount
+        splitCid <- create this with amount = splitAmount
+        remainingCid <- create this with amount = remainingAmount
+        return (splitCid, remainingCid)
+
+-- | A minimal Slashing Rules template for testing purposes.
+template SlashingRules
+  with
+    operator: Party
+  where
+    signatory operator
+
+-- | Test suite for the main staking lifecycle.
 stakingTests = script do
-  -- Run the main lifecycle test
-  stakingLifecycleTest
+  test_full_staking_lifecycle
+  test_multiple_delegators_share_rewards
+  test_delegation_fails_below_minimum
+  test_unbonding_claim_fails_before_cooldown
 
-  -- Run the slashing scenario test
-  slashingTest
+-- | Helper to set up the common test environment.
+setup = do
+  operator <- allocatePartyWithHint "Operator" (PartyIdHint "operator")
+  validator <- allocatePartyWithHint "Validator" (PartyIdHint "validator")
+  delegator1 <- allocatePartyWithHint "Delegator1" (PartyIdHint "delegator1")
+  delegator2 <- allocatePartyWithHint "Delegator2" (PartyIdHint "delegator2")
+  tokenIssuer <- allocatePartyWithHint "TokenIssuer" (PartyIdHint "token-issuer")
+  rewardIssuer <- allocatePartyWithHint "RewardIssuer" (PartyIdHint "reward-issuer")
 
--- Test Scenario 1: A full, successful lifecycle of a delegation.
--- Covers: Staking, Reward Accrual, and Unbonding.
-stakingLifecycleTest = script do
-  -- === 1. SETUP: ALLOCATE PARTIES AND INITIAL CONTRACTS ===
-  -- ========================================================
-  debug "Setting up parties for staking lifecycle test..."
-  validator <- allocateParty "Validator"
-  delegator1 <- allocateParty "Delegator1"
-  delegator2 <- allocateParty "Delegator2"
-  operator <- allocateParty "Operator"
+  let
+    stakedAsset = "STAKE"
+    rewardAsset = "REWARD"
 
-  -- Define core parameters for the stake pool
-  let unbondingPeriod = days 7
+  now <- getTime
 
-  -- The validator creates a new stake pool, initializing it.
-  poolCid <- submit validator do
-    createCmd StakePool with
-      validator
+  slashingRulesCid <- submit operator do createCmd SlashingRules with operator
+
+  let
+    poolConfig = PoolConfig with
       operator
-      tokenId = "CANTON_STAKE_TOKEN"
-      unbondingPeriod
-      totalStaked = 0.0
-      delegators = []
+      validator
+      stakedAsset
+      rewardAsset
+      unbondingPeriod = D.days 30
+      minDelegation = 10.0
+      slashingRulesCid
 
-  -- === 2. DELEGATION PHASE: DELEGATORS STAKE TOKENS ===
-  -- ===================================================
-  debug "Testing delegation phase..."
-  -- Delegator1 stakes 1000.0 tokens
-  let delegation1Amount = 1000.0
-  delegation1Cid <- submit delegator1 do
-    exerciseCmd poolCid Delegate with delegator = delegator1, amount = delegation1Amount
-
-  -- Delegator2 stakes 3000.0 tokens
-  let delegation2Amount = 3000.0
-  delegation2Cid <- submit delegator2 do
-    exerciseCmd poolCid Delegate with delegator = delegator2, amount = delegation2Amount
-
-  -- Validate the state of the pool after delegations
-  pool <- fetch poolCid
-  pool.totalStaked === (delegation1Amount + delegation2Amount)
-  length pool.delegators === 2
-  debug "Delegations successful. Pool state is correct."
-
-  -- === 3. REWARD ACCRUAL PHASE: VALIDATOR DISTRIBUTES REWARDS ===
-  -- ==============================================================
-  debug "Testing reward accrual phase..."
-  -- Validator triggers a reward distribution for epoch 1.
-  -- Total reward of 400.0 will be split proportionally.
-  let totalReward = 400.0
-  let epoch = 1
-  submit validator do
-    exerciseCmd poolCid AccrueRewards with totalReward, epoch
-
-  -- Find the reward proposals created for each delegator.
-  -- The test assumes RewardAccrualProposal has a key of (validator, delegator, epoch).
-  (proposal1Cid, _) <- queryContractKey @RewardAccrualProposal delegator1 (validator, delegator1, epoch) >>= assertSome "Reward proposal for delegator1 not found"
-  (proposal2Cid, _) <- queryContractKey @RewardAccrualProposal delegator2 (validator, delegator2, epoch) >>= assertSome "Reward proposal for delegator2 not found"
-
-  -- Delegators accept their rewards, which compounds their stake.
-  updatedDelegation1Cid <- submit delegator1 $ exerciseCmd proposal1Cid AcceptReward
-  updatedDelegation2Cid <- submit delegator2 $ exerciseCmd proposal2Cid AcceptReward
-
-  -- Validate the delegation amounts have increased correctly.
-  -- Delegator1 share: 1000 / 4000 = 25% -> reward = 100.0
-  -- Delegator2 share: 3000 / 4000 = 75% -> reward = 300.0
-  updatedDelegation1 <- fetch updatedDelegation1Cid
-  updatedDelegation1.stakedAmount === (delegation1Amount + 100.0)
-
-  updatedDelegation2 <- fetch updatedDelegation2Cid
-  updatedDelegation2.stakedAmount === (delegation2Amount + 300.0)
-  debug "Rewards accepted. Delegation amounts updated correctly."
-
-  -- Validate the pool's total staked amount reflects the compounded rewards.
-  updatedPool <- fetch poolCid
-  updatedPool.totalStaked === (delegation1Amount + delegation2Amount + totalReward)
-  debug "Pool total stake updated correctly after rewards."
-
-  -- === 4. UNBONDING PHASE: DELEGATOR1 WITHDRAWS STAKE ===
-  -- =====================================================
-  debug "Testing unbonding phase..."
-  -- Delegator1 initiates the unbonding process for their entire stake.
-  unbondingCid <- submit delegator1 do
-    exerciseCmd updatedDelegation1Cid RequestUnbonding
-
-  -- Validate that an UnbondingDelegation contract was created with the correct details.
-  startTime <- getTime
-  unbondingDelegation <- fetch unbondingCid
-  unbondingDelegation.delegator === delegator1
-  unbondingDelegation.unbondingAmount === updatedDelegation1.stakedAmount
-  assert (unbondingDelegation.cooldownEndsAt > startTime)
-  debug "Unbonding request successful. Cooldown period started."
-
-  -- Advance ledger time to simulate the unbonding period passing.
-  passTime (convertRelTime (unbondingPeriod + days 1))
-  debug "Ledger time advanced past cooldown period."
-
-  -- Delegator1 finalizes the unbonding to reclaim their tokens.
-  submit delegator1 do
-    exerciseCmd unbondingCid FinalizeUnbonding
-
-  -- Validate the final state of the pool and contracts.
-  -- The UnbondingDelegation contract should now be archived.
-  assertMsg "UnbondingDelegation contract should be archived" (isNone <$> queryContractId delegator1 unbondingCid)
-
-  -- The pool's total stake and delegator list should be updated.
-  finalPool <- fetch poolCid
-  finalPool.totalStaked === updatedDelegation2.stakedAmount
-  finalPool.delegators === [delegator2]
-  debug "Unbonding finalized. Pool state is correct. Lifecycle test complete."
-
-  pure ()
-
-
--- Test Scenario 2: A slashing event occurs, reducing staked amounts.
--- Covers: Slashing a percentage of the total pool stake.
-slashingTest = script do
-  -- === 1. SETUP: CREATE POOL AND DELEGATIONS ===
-  -- =============================================
-  debug "Setting up parties for slashing test..."
-  validator <- allocateParty "Validator"
-  delegator1 <- allocateParty "Delegator1"
-  delegator2 <- allocateParty "Delegator2"
-  operator <- allocateParty "Operator"
+  poolConfigCid <- submit operator do createCmd poolConfig
 
   poolCid <- submit validator do
-    createCmd StakePool with
-      validator
-      operator
-      tokenId = "CANTON_STAKE_TOKEN"
-      unbondingPeriod = days 7
+    createCmd Pool with
+      configCid = poolConfigCid
       totalStaked = 0.0
-      delegators = []
+      totalShares = 0.0
+      lastRewardUpdate = now
+      isPaused = False
 
-  let delegation1Amount = 5000.0
-  _ <- submit delegator1 $ exerciseCmd poolCid Delegate with delegator = delegator1, amount = delegation1Amount
+  -- Allocate initial assets for delegators and rewards
+  d1Iou <- submit tokenIssuer do
+    createCmd Iou with issuer = tokenIssuer, owner = delegator1, asset = stakedAsset, amount = 1000.0
+  d2Iou <- submit tokenIssuer do
+    createCmd Iou with issuer = tokenIssuer, owner = delegator2, asset = stakedAsset, amount = 1000.0
+  rewardIou <- submit rewardIssuer do
+    createCmd Iou with issuer = rewardIssuer, owner = operator, asset = rewardAsset, amount = 5000.0
 
-  let delegation2Amount = 15000.0
-  _ <- submit delegator2 $ exerciseCmd poolCid Delegate with delegator = delegator2, amount = delegation2Amount
+  return (operator, validator, delegator1, delegator2, tokenIssuer, poolConfig, poolCid, d1Iou, d2Iou, rewardIou)
 
-  let initialTotalStake = delegation1Amount + delegation2Amount
-  initialPool <- fetch poolCid
-  initialPool.totalStaked === initialTotalStake
-  debug "Slashing test setup complete. Delegations created."
+test_full_staking_lifecycle = script do
+  (operator, validator, delegator1, _, tokenIssuer, poolConfig, poolCid0, d1Iou0, _, _) <- setup
 
-  -- === 2. SLASHING EVENT: OPERATOR SLASHES THE POOL ===
-  -- ====================================================
-  debug "Testing slashing event..."
-  let slashPercentage = 0.1 -- Slash 10%
-  let slashReason = "Validator double-signed a block"
+  -- 1. Delegate
+  let delegationAmount = 100.0
+  (d1Iou1, _) <- submit delegator1 do exerciseCmd d1Iou0 Split with splitAmount = delegationAmount
 
-  -- The operator exercises the Slash choice on the pool.
-  -- This is assumed to archive the old pool/delegations and create new ones with reduced values.
-  slashedPoolCid <- submit operator do
-    exerciseCmd poolCid Slash with slashPercentage, reason = slashReason
+  offerCid <- submit delegator1 do
+    createCmd DelegationOffer with
+      delegator = delegator1
+      poolCid = poolCid0
+      stakedAssetCid = d1Iou1
 
-  -- === 3. VALIDATION: VERIFY REDUCED STAKE AMOUNTS ===
-  -- ===================================================
-  -- Check the new pool's total staked amount.
-  slashedPool <- fetch slashedPoolCid
-  let expectedSlashedTotal = initialTotalStake * (1.0 - slashPercentage)
-  slashedPool.totalStaked === expectedSlashedTotal
-  debug "Pool total stake correctly reduced after slashing."
+  (delegationCid, poolCid1) <- submit validator do
+    exerciseCmd offerCid AcceptDelegation
 
-  -- Find the new, slashed delegation contracts.
-  -- Assumes Delegation contract has a key of (validator, delegator).
-  (slashedDelegation1Cid, _) <- queryContractKey @Delegation delegator1 (validator, delegator1) >>= assertSome "Slashed delegation for delegator1 not found"
-  (slashedDelegation2Cid, _) <- queryContractKey @Delegation delegator2 (validator, delegator2) >>= assertSome "Slashed delegation for delegator2 not found"
+  -- Assert delegation state
+  [(_, delegation)] <- query delegator1
+  delegation.delegator === delegator1
+  delegation.shares === delegationAmount
+  [(_, pool1)] <- query validator
+  pool1.totalStaked === delegationAmount
+  pool1.totalShares === delegationAmount
 
-  -- Check each delegation's slashed amount.
-  slashedDelegation1 <- fetch slashedDelegation1Cid
-  let expectedSlashedDelegation1 = delegation1Amount * (1.0 - slashPercentage)
-  slashedDelegation1.stakedAmount === expectedSlashedDelegation1
+  -- 2. Accrue Rewards
+  passTime (D.days 180)
+  now <- getTime
 
-  slashedDelegation2 <- fetch slashedDelegation2Cid
-  let expectedSlashedDelegation2 = delegation2Amount * (1.0 - slashPercentage)
-  slashedDelegation2.stakedAmount === expectedSlashedDelegation2
-  debug "Individual delegation stakes correctly reduced."
+  -- Use a dummy reward amount for simplicity
+  let rewardAmount = 5.0
+  rewardIouCid <- submit operator do
+    createCmd Iou with issuer = tokenIssuer, owner = operator, asset = poolConfig.stakedAsset, amount = rewardAmount
 
-  -- Verify original pool contract was archived by the slash action.
-  assertMsg "Original pool should be archived" (isNone <$> queryContractId validator poolCid)
-  debug "Slashing test complete. All states are correct."
+  poolCid2 <- submit operator do
+    exerciseCmd poolCid1 AccrueRewards with rewardIouCid; currentTime = now
 
+  -- Assert reward accrual
+  [(_, pool2)] <- query validator
+  pool2.totalStaked === 105.0 -- 100 original + 5 reward
+  pool2.totalShares === 100.0 -- Shares don't change
+  let sharePrice = pool2.totalStaked / pool2.totalShares
+  sharePrice === 1.05
+
+  -- 3. Initiate Unbonding
+  (unbondingRequestCid, _poolCid3) <- submit delegator1 do
+    exerciseCmd delegationCid InitiateUnbonding with sharesToUnbond = delegation.shares
+
+  -- Assert unbonding request state
+  [(_, req)] <- query delegator1
+  req.delegator === delegator1
+  -- Unbonding amount is shares * current share price
+  req.unbondingAmount === (delegation.shares * sharePrice)
+  req.unbondingAmount === 105.0
+  req.asset === poolConfig.stakedAsset
+  req.claimableAt === T.addRelTime now poolConfig.unbondingPeriod
+
+  -- 4. Claim Unbonded Tokens
+  passTime poolConfig.unbondingPeriod
+  passTime (seconds 1) -- Pass a little extra to avoid boundary condition errors
+
+  _claimedIouCid <- submit delegator1 do
+    exerciseCmd unbondingRequestCid ClaimUnbonded with tokenIssuer
+
+  -- Assert final state
+  unbondingContracts <- query delegator1
+  unbondingContracts === [] -- Request contract is archived
+
+  finalIous <- query delegator1
+  let finalBalance = sum (map (\(_, c) -> c.amount) finalIous)
+  -- Initial 1000 - 100 staked + 105 claimed
+  finalBalance === 1005.0
+
+test_multiple_delegators_share_rewards = script do
+  (operator, validator, delegator1, delegator2, tokenIssuer, poolConfig, poolCid0, d1Iou0, d2Iou0, _) <- setup
+
+  -- Delegator 1 stakes 100
+  let d1Amount = 100.0
+  (d1Iou1, _) <- submit delegator1 do exerciseCmd d1Iou0 Split with splitAmount = d1Amount
+  offer1Cid <- submit delegator1 do createCmd DelegationOffer with delegator = delegator1; poolCid = poolCid0; stakedAssetCid = d1Iou1
+  (d1DelegationCid, poolCid1) <- submit validator do exerciseCmd offer1Cid AcceptDelegation
+
+  -- Delegator 2 stakes 300
+  let d2Amount = 300.0
+  (d2Iou1, _) <- submit delegator2 do exerciseCmd d2Iou0 Split with splitAmount = d2Amount
+  offer2Cid <- submit delegator2 do createCmd DelegationOffer with delegator = delegator2; poolCid = poolCid1; stakedAssetCid = d2Iou1
+  (d2DelegationCid, poolCid2) <- submit validator do exerciseCmd offer2Cid AcceptDelegation
+
+  -- Pool state: 400 total staked, 400 total shares. Share price = 1.0
+  [(_, pool2)] <- query validator
+  pool2.totalStaked === 400.0
+  pool2.totalShares === 400.0
+
+  -- Accrue 40 in rewards
+  passTime (D.days 90)
+  now <- getTime
+  let rewardAmount = 40.0
+  rewardIouCid <- submit operator do createCmd Iou with issuer = tokenIssuer, owner = operator, asset = poolConfig.stakedAsset, amount = rewardAmount
+  poolCid3 <- submit operator do exerciseCmd poolCid2 AccrueRewards with rewardIouCid; currentTime = now
+
+  -- Pool state: 440 total staked, 400 total shares. Share price = 1.1
+  [(_, pool3)] <- query validator
+  pool3.totalStaked === 440.0
+  pool3.totalShares === 400.0
+  let sharePrice = pool3.totalStaked / pool3.totalShares
+  sharePrice === 1.1
+
+  -- Delegator 1 unbonds all 100 shares
+  (d1UnbondCid, _poolCid4) <- submit delegator1 do exerciseCmd d1DelegationCid InitiateUnbonding with sharesToUnbond = 100.0
+  [(_, d1Req)] <- query delegator1
+  -- Expected amount: 100 shares * 1.1 share price = 110.0
+  d1Req.unbondingAmount === 110.0
+
+  -- Delegator 2 unbonds all 300 shares
+  (d2UnbondCid, _poolCid5) <- submit delegator2 do exerciseCmd d2DelegationCid InitiateUnbonding with sharesToUnbond = 300.0
+  [(_, d2Req)] <- query delegator2
+  -- Expected amount: 300 shares * 1.1 share price = 330.0
+  d2Req.unbondingAmount === 330.0
+
+test_delegation_fails_below_minimum = script do
+  (_, validator, delegator1, _, _, poolConfig, poolCid, d1Iou, _, _) <- setup
+
+  let smallAmount = poolConfig.minDelegation - 1.0
+  (smallIou, _) <- submit delegator1 do exerciseCmd d1Iou Split with splitAmount = smallAmount
+
+  -- Attempt to create an offer with an amount below the minimum
+  submitMustFail delegator1 do
+    createCmd DelegationOffer with
+      delegator = delegator1
+      poolCid
+      stakedAssetCid = smallIou
+
+test_unbonding_claim_fails_before_cooldown = script do
+  (_, validator, delegator1, _, tokenIssuer, poolConfig, poolCid0, d1Iou0, _, _) <- setup
+
+  -- Delegate
+  let delegationAmount = 100.0
+  (d1Iou1, _) <- submit delegator1 do exerciseCmd d1Iou0 Split with splitAmount = delegationAmount
+  offerCid <- submit delegator1 do createCmd DelegationOffer with delegator = delegator1; poolCid = poolCid0; stakedAssetCid = d1Iou1
+  (delegationCid, _poolCid1) <- submit validator do exerciseCmd offerCid AcceptDelegation
+  [(_, delegation)] <- query delegator1
+
+  -- Initiate Unbonding
+  (unbondingRequestCid, _) <- submit delegator1 do
+    exerciseCmd delegationCid InitiateUnbonding with sharesToUnbond = delegation.shares
+
+  -- Attempt to claim immediately
+  submitMustFail delegator1 do
+    exerciseCmd unbondingRequestCid ClaimUnbonded with tokenIssuer
+
+  -- Pass some time, but not enough
+  passTime (D.days 15)
+  submitMustFail delegator1 do
+    exerciseCmd unbondingRequestCid ClaimUnbonded with tokenIssuer
+
+  -- Pass the full period, now it should succeed
+  passTime (D.days 16) -- 15 + 16 > 30
+  _ <- submit delegator1 do
+    exerciseCmd unbondingRequestCid ClaimUnbonded with tokenIssuer
   pure ()
