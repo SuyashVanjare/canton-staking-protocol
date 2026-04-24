@@ -1,37 +1,35 @@
-name: Daml CI
+name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
   pull_request:
-    branches: [ "main" ]
+    branches:
+      - main
 
 jobs:
-  build-and-test:
-    name: Build, Lint, and Test Daml Project
+  build-test-lint:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Cache Daml dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.daml
-          key: ${{ runner.os }}-daml-${{ hashFiles('daml.yaml') }}
-          restore-keys: |
-            ${{ runner.os }}-daml-
+      - name: Install DPM (Daml Package Manager)
+        run: curl https://get.digitalasset.com/install/install.sh | sh
 
-      - name: Install Daml SDK v3.1.0
-        run: |
-          curl -sSL https://get.daml.com/ | sh -s 3.1.0
-          echo "$HOME/.daml/bin" >> $GITHUB_PATH
+      - name: Add DPM to PATH
+        run: echo "$HOME/.dpm/bin" >> $GITHUB_PATH
 
-      - name: Build Daml project
-        run: daml build
+      - name: Show DPM version
+        run: dpm --version
 
       - name: Lint Daml code
-        run: daml damlc -- --lint daml
+        run: dpm damlc lint daml
+
+      - name: Build Daml code
+        run: dpm build
 
       - name: Run Daml tests
-        run: daml test
+        run: dpm test
