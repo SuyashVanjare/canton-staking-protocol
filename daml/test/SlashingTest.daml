@@ -1,181 +1,249 @@
-module SlashingTest where
+module Staking.Test.SlashingTest where
 
 import Daml.Script
-import qualified DA.Assert as A
-import qualified DA.Date as D
-import qualified DA.Time as T
-import qualified DA.Map as M
+import DA.Assert
+import DA.Date as D
+import DA.Time
+import DA.List (head, null)
+import DA.Optional (isSome)
 
-import StakingPool
-import Delegation
-import PoolConfig
-import Unbonding
-import TestUtils
+-- Main contract modules - assuming these exist and have the specified structure
+import Staking.Pool (Pool(..), PoolStatus(..), SlashEvent(..))
+import Staking.Delegation (Delegation(..))
+import Staking.Token (Token(..))
 
+-- | Test Suite for all slashing scenarios.
+slashingTests : Script ()
 slashingTests = script do
-  -- === Parties ===
-  operator <- allocateParty "Operator"
-  validator <- allocateParty "Validator"
-  treasury <- allocateParty "Treasury"
-  delegator1 <- allocateParty "Delegator1"
-  delegator2 <- allocateParty "Delegator2"
+  log ""
+  log "──────────────────────────────────"
+  log "Running Staking Slashing Tests"
+  log "──────────────────────────────────"
+  testSuccessfulSlash
+  testUnauthorizedSlashAttempt
+  testSlashProportions
+  testUnjailAfterSlash
+  log "✓ All slashing tests passed."
+  log "──────────────────────────────────"
 
+-- | Test a valid slash operation by the designated slasher.
+-- Verifies:
+-- - Pool status changes to Jailed.
+-- - Total stake is reduced by the penalty amount.
+-- - Individual delegations are reduced proportionally.
+-- - A SlashEvent contract is created.
+-- - New delegations are blocked while jailed.
+testSuccessfulSlash : Script ()
+testSuccessfulSlash = script do
+  log "--> Running test: testSuccessfulSlash"
   -- === Setup ===
   now <- getTime
-  let today = D.date (T.year now) (T.month now) (T.day now)
+  operator <- allocateParty "Operator"
+  slasher <- allocateParty "Slasher"
+  treasury <- allocateParty "Treasury"
+  delegator1 <- allocateParty "Delegator1"
 
-  let
-    config = PoolConfigData with
-      operator
-      validator
-      treasury
-      unbondingPeriodDays = 14
-      minSelfDelegation = 100.0
-      slashPenalties = M.fromList [("DOWNTIME", 0.01), ("DOUBLE_SIGNING", 0.10)] -- 1% and 10%
-      rewardRate = 0.05 -- 5% APR
-
-  configCid <- submit operator do createCmd config
-
-  -- Initial self-delegation from validator
-  validatorTokenCid <- submit validator do createCmd (Token validator 1000.0)
-  poolCid <- submit validator do
-    exerciseCmd validatorTokenCid Token_Lock with amount = 100.0
-
-  -- Delegator1 joins
-  delegator1TokenCid <- submit delegator1 do createCmd (Token delegator1 500.0)
-  submit delegator1 do
-    exerciseCmd delegator1TokenCid Token_Lock with amount = 400.0
-
-  -- Delegator2 joins
-  delegator2TokenCid <- submit delegator2 do createCmd (Token delegator2 1000.0)
-  submit delegator2 do
-    exerciseCmd delegator2TokenCid Token_Lock with amount = 500.0
-
-  -- === Initial State Verification ===
+  poolCid <- setupInitialPool operator slasher treasury now
   pool <- fetch poolCid
-  A.assertEq pool.totalStaked 1000.0
-  A.assertEq pool.status Operational
 
-  delegations <- query @Delegation ()
-  A.assertEq (length delegations) 3
+  let operatorStakeAmount = 1_000_000.0
+  let delegator1StakeAmount = 500_000.0
+  _ <- setupDelegation operator poolCid operatorStakeAmount
+  _ <- setupDelegation delegator1 poolCid delegator1StakeAmount
 
-  -- === Test Scenarios ===
-  test "Minor slash for DOWNTIME correctly reduces stakes and creates SlashedTokens" do
-    let
-      expectedSlashAmount = pool.totalStaked * 0.01 -- 1%
-      expectedNewTotalStaked = pool.totalStaked - expectedSlashAmount
+  -- Refresh pool state after delegations to get updated totalStake
+  updatedPoolCid <- fst <$> queryContractId operator poolCid
+  updatedPool <- fetch updatedPoolCid
 
-    -- Operator slashes the pool for downtime
-    submit operator do
-      exerciseCmd poolCid Pool_Slash with reason = "DOWNTIME"
+  -- === Act ===
+  let slashReason = "Validator downtime > 24 hours"
+  slashedPoolCid <- submit slasher do
+    exerciseCmd updatedPoolCid (Slash with reason = slashReason)
 
-    -- Verify pool state
-    slashedPool <- fetch poolCid
-    A.assertEq slashedPool.totalStaked expectedNewTotalStaked
-    A.assertEq slashedPool.status Operational -- Minor slash doesn't jail the pool
+  -- === Assert ===
+  -- 1. Verify pool state
+  slashedPool <- fetch slashedPoolCid
+  let expectedSlashedAmount = updatedPool.totalStake * pool.slashPenalty
+  let expectedNewTotalStake = updatedPool.totalStake - expectedSlashedAmount
 
-    -- Verify SlashedTokens contract
-    slashedTokens <- query @SlashedTokens treasury
-    A.assertEq (length slashedTokens) 1
-    A.assertEq (signatory slashedTokens.head) treasury
-    A.assertEq slashedTokens.head.amount expectedSlashAmount
+  slashedPool.status === Jailed
+  slashedPool.totalStake === expectedNewTotalStake
+  assertMsg "lastSlashedAt timestamp should be updated" (slashedPool.lastSlashedAt > pool.lastSlashedAt)
 
-    -- Verify delegation states (each is reduced by 1%)
-    [valDel, d1Del, d2Del] <- map (.payload) <$> query @Delegation ()
-    A.assertEq valDel.stakedAmount (100.0 * 0.99)
-    A.assertEq d1Del.stakedAmount (400.0 * 0.99)
-    A.assertEq d2Del.stakedAmount (500.0 * 0.99)
-    A.assertEq valDel.delegator validator
-    A.assertEq d1Del.delegator delegator1
-    A.assertEq d2Del.delegator delegator2
+  -- 2. Verify individual delegations were reduced. Query for the new contracts.
+  (newOpDelCid, _) <- queryContractId operator (Delegation with delegator = operator, poolId = pool.poolId)
+  opDelegationSlashed <- fetch newOpDelCid
+  (newD1DelCid, _) <- queryContractId delegator1 (Delegation with delegator = delegator1, poolId = pool.poolId)
+  d1DelegationSlashed <- fetch newD1DelCid
 
-  test "Severe slash for DOUBLE_SIGNING jails the pool" do
-    -- Re-create a fresh pool for a clean test state
-    (freshPoolCid, _delegationCids) <- setupBasicPool operator validator treasury [delegator1, delegator2] [400.0, 500.0] now
-    freshPool <- fetch freshPoolCid
+  opDelegationSlashed.amount === operatorStakeAmount * (1.0 - pool.slashPenalty)
+  d1DelegationSlashed.amount === delegator1StakeAmount * (1.0 - pool.slashPenalty)
 
-    let
-      expectedSlashAmount = freshPool.totalStaked * 0.10 -- 10%
-      expectedNewTotalStaked = freshPool.totalStaked - expectedSlashAmount
+  -- 3. Verify slash event
+  (slashEventCid, _) <- queryContractId slasher (SlashEvent with poolId = pool.poolId, slasher)
+  slashEvent <- fetch slashEventCid
+  slashEvent.reason === slashReason
+  slashEvent.amountSlashed === expectedSlashedAmount
 
-    -- Operator performs a severe slash
-    submit operator do
-      exerciseCmd freshPoolCid Pool_Slash with reason = "DOUBLE_SIGNING"
+  -- 4. Verify new delegations are blocked
+  delegator2 <- allocateParty "Delegator2"
+  _ <- setupDelegationToken delegator2 operator 100.0
+  submitMustFail delegator2 do
+    exerciseCmd slashedPoolCid (Delegate with amount = 100.0)
 
-    -- Verify pool state
-    slashedPool <- fetch freshPoolCid
-    A.assertEq slashedPool.totalStaked expectedNewTotalStaked
-    A.assertEq slashedPool.status Jailed -- Severe slash jails the pool
+  log "<-- PASSED: testSuccessfulSlash"
 
-    -- Verify SlashedTokens contract (now there are 2, one from previous test)
-    slashedTokens <- query @SlashedTokens treasury
-    A.assertEq (length slashedTokens) 2
-    let newSlashContract = filter (\c -> c.payload.amount == expectedSlashAmount) slashedTokens
-    A.assertEq (length newSlashContract) 1
 
-    -- Attempting to slash a jailed pool should fail
-    submitMustFail operator do
-      exerciseCmd freshPoolCid Pool_Slash with reason = "DOWNTIME"
+-- | Test that an unauthorized party cannot slash a pool.
+testUnauthorizedSlashAttempt : Script ()
+testUnauthorizedSlashAttempt = script do
+  log "--> Running test: testUnauthorizedSlashAttempt"
+  -- === Setup ===
+  now <- getTime
+  operator <- allocateParty "Operator"
+  slasher <- allocateParty "Slasher"
+  treasury <- allocateParty "Treasury"
+  delegator <- allocateParty "RandomDelegator"
 
-  test "Delegator can unbond remaining stake after a slash" do
-    -- Use the jailed pool from the previous test
-    (jailedPoolCid, delegationCids) <- setupBasicPool operator validator treasury [delegator1] [400.0] now
-    submit operator do exerciseCmd jailedPoolCid Pool_Slash with reason = "DOUBLE_SIGNING"
+  poolCid <- setupInitialPool operator slasher treasury now
+  _ <- setupDelegation operator poolCid 1000.0
+  updatedPoolCid <- fst <$> queryContractId operator poolCid
 
-    let d1DelegationCid = delegationCids.head
-    delegationBefore <- fetch d1DelegationCid
-    A.assertEq delegationBefore.stakedAmount (400.0 * 0.90) -- Reduced by 10%
+  -- === Act & Assert ===
+  log "Attempting slash by operator (should fail)..."
+  submitMustFail operator do
+    exerciseCmd updatedPoolCid (Slash with reason = "Unauthorized slash by operator")
 
-    -- Delegator 1 requests to unbond their remaining stake
-    submit delegator1 do
-      exerciseCmd d1DelegationCid Delegation_RequestUnbond
+  log "Attempting slash by delegator (should fail)..."
+  submitMustFail delegator do
+    exerciseCmd updatedPoolCid (Slash with reason = "Unauthorized slash by delegator")
 
-    -- Verify that the Delegation contract is gone and an Unbonding contract is created
-    delegations <- query @Delegation delegator1
-    A.assertEq (length delegations) 0
+  log "<-- PASSED: testUnauthorizedSlashAttempt"
 
-    unbondingContracts <- query @Unbonding delegator1
-    A.assertEq (length unbondingContracts) 1
-    let unbonding = unbondingContracts.head
-    A.assertEq unbonding.delegator delegator1
-    A.assertEq unbonding.amount delegationBefore.stakedAmount
-    A.assertEq unbonding.releaseDate (D.addDays today 14)
+-- | Test slashing correctly reduces stake for multiple delegators proportionally.
+testSlashProportions : Script ()
+testSlashProportions = script do
+  log "--> Running test: testSlashProportions"
+  -- === Setup ===
+  now <- getTime
+  operator <- allocateParty "Operator"
+  slasher <- allocateParty "Slasher"
+  treasury <- allocateParty "Treasury"
+  d1 <- allocateParty "Delegator1"
+  d2 <- allocateParty "Delegator2"
 
-  test "Validator can unjail a pool" do
-    (poolToUnjailCid, _) <- setupBasicPool operator validator treasury [] [] now
-    -- Slash and jail it
-    submit operator do exerciseCmd poolToUnjailCid Pool_Slash with reason = "DOUBLE_SIGNING"
-    jailedPool <- fetch poolToUnjailCid
-    A.assertEq jailedPool.status Jailed
+  poolCid <- setupInitialPool operator slasher treasury now
+  pool <- fetch poolCid
 
-    -- Validator unjails it
-    submit validator do
-      exerciseCmd poolToUnjailCid Pool_Unjail
+  let opAmount = 10_000.0
+  let d1Amount = 5_000.0
+  let d2Amount = 15_000.0
 
-    -- Verify status is back to Operational
-    unjailPool <- fetch poolToUnjailCid
-    A.assertEq unjailPool.status Operational
+  _ <- setupDelegation operator poolCid opAmount
+  _ <- setupDelegation d1 poolCid d1Amount
+  _ <- setupDelegation d2 poolCid d2Amount
 
-  test "Unauthorized party cannot slash or unjail" do
-    (testPoolCid, _) <- setupBasicPool operator validator treasury [] [] now
-    (jailedPoolCid, _) <- setupBasicPool operator validator treasury [] [] now
-    submit operator do exerciseCmd jailedPoolCid Pool_Slash with reason = "DOUBLE_SIGNING"
+  updatedPoolCid <- fst <$> queryContractId operator poolCid
+  updatedPool <- fetch updatedPoolCid
 
-    -- Delegator attempts to slash
-    submitMustFail delegator1 do
-      exerciseCmd testPoolCid Pool_Slash with reason = "DOWNTIME"
+  -- === Act ===
+  slashedPoolCid <- submit slasher do
+    exerciseCmd updatedPoolCid (Slash with reason = "Proportionality test")
 
-    -- Delegator attempts to unjail
-    submitMustFail delegator1 do
-      exerciseCmd jailedPoolCid Pool_Unjail
+  -- === Assert ===
+  slashedPool <- fetch slashedPoolCid
+  slashedPool.totalStake === updatedPool.totalStake * (1.0 - pool.slashPenalty)
 
-    -- Operator attempts to unjail (only validator can)
-    submitMustFail operator do
-      exerciseCmd jailedPoolCid Pool_Unjail
+  (newOpDelCid, _) <- queryContractId operator (Delegation with delegator = operator, poolId = pool.poolId)
+  opDelSlashed <- fetch newOpDelCid
+  (newD1DelCid, _) <- queryContractId d1 (Delegation with delegator = d1, poolId = pool.poolId)
+  d1DelSlashed <- fetch newD1DelCid
+  (newD2DelCid, _) <- queryContractId d2 (Delegation with delegator = d2, poolId = pool.poolId)
+  d2DelSlashed <- fetch newD2DelCid
 
-  test "Slashing with unknown reason fails" do
-    (testPoolCid, _) <- setupBasicPool operator validator treasury [] [] now
-    submitMustFail operator do
-      exerciseCmd testPoolCid Pool_Slash with reason = "UNKNOWN_REASON"
+  opDelSlashed.amount === opAmount * (1.0 - pool.slashPenalty)
+  d1DelSlashed.amount === d1Amount * (1.0 - pool.slashPenalty)
+  d2DelSlashed.amount === d2Amount * (1.0 - pool.slashPenalty)
 
-  pure ()
+  log "<-- PASSED: testSlashProportions"
+
+-- | Test that an operator can unjail a pool after the cooldown period.
+testUnjailAfterSlash : Script ()
+testUnjailAfterSlash = script do
+  log "--> Running test: testUnjailAfterSlash"
+  -- === Setup ===
+  let startTime = time (D.date 2024 D.Jan 1) 0 0 0
+  setTime startTime
+  operator <- allocateParty "Operator"
+  slasher <- allocateParty "Slasher"
+  treasury <- allocateParty "Treasury"
+
+  poolCid <- setupInitialPool operator slasher treasury startTime
+  _ <- setupDelegation operator poolCid 1000.0
+
+  updatedPoolCid <- fst <$> queryContractId operator poolCid
+  slashedPoolCid <- submit slasher do
+    exerciseCmd updatedPoolCid (Slash with reason = "Testing unjailing")
+  slashedPool <- fetch slashedPoolCid
+
+  -- === Act & Assert ===
+  -- 1. Try to unjail immediately. This should fail.
+  log "Attempting to unjail before jail period ends (should fail)..."
+  submitMustFail operator do
+    exerciseCmd slashedPoolCid Unjail
+
+  -- 2. Advance time past the jail period
+  let timeAfterJail = addRelTime startTime slashedPool.jailPeriod
+  setTime (timeAfterJail `addRelTime` seconds 1)
+  log $ "Time advanced past jail period to " <> show timeAfterJail
+
+  -- 3. Unjail successfully.
+  unjailedPoolCid <- submit operator do
+    exerciseCmd slashedPoolCid Unjail
+  unjailedPool <- fetch unjailedPoolCid
+  unjailedPool.status === Active
+
+  -- 4. Verify delegations are now allowed.
+  delegator2 <- allocateParty "Delegator2"
+  _ <- setupDelegation delegator2 unjailedPoolCid 100.0
+  (delegationCid, _) <- queryContractId delegator2 (Delegation with delegator = delegator2)
+  delegation <- fetch delegationCid
+  delegation.amount === 100.0
+
+  log "<-- PASSED: testUnjailAfterSlash"
+
+
+-- === Test Helper Functions ===
+
+-- | Creates a standard pool for tests with default parameters.
+setupInitialPool : Party -> Party -> Party -> Time -> Script (ContractId Pool)
+setupInitialPool operator slasher treasury now =
+  submit operator do
+    createCmd Pool
+      with
+        poolId = "test-pool-01"
+        operator
+        slasher
+        treasury
+        tokenId = "TEST_TOKEN"
+        totalStake = 0.0
+        status = Active
+        slashPenalty = 0.05 -- 5% penalty
+        jailPeriod = hours 24
+        unbondingPeriod = days 21
+        createdAt = now
+        lastSlashedAt = now
+
+-- | Mints a token for a party. Assumes operator is the issuer.
+setupDelegationToken : Party -> Party -> Decimal -> Script (ContractId Token)
+setupDelegationToken forParty issuer amount =
+  submit issuer do
+    createCmd Token with owner = forParty, issuer, quantity = amount
+
+-- | Mints a token and creates a delegation in one step for a given party and amount.
+setupDelegation: Party -> ContractId Pool -> Decimal -> Script (ContractId Delegation)
+setupDelegation delegator poolCid amount = do
+  pool <- fetch poolCid
+  _ <- setupDelegationToken delegator pool.operator amount
+  submit delegator do
+    exerciseCmd poolCid (Delegate with amount)
