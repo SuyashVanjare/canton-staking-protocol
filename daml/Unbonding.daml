@@ -1,62 +1,147 @@
-module Unbonding where
+-- Copyright (c) 2024 Digital Asset (Switzerland) GmbH and/or its affiliates. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
 
-import DA.Time (Time)
-import DA.Assert ((assert))
+module Staking.Unbonding where
 
--- | Represents a successful withdrawal of unbonded tokens.
--- This contract would typically be consumed by a settlement process
--- or converted back into a fungible token contract.
-template WithdrawnFunds
+import Daml.Script
+import DA.Time (Time, RelTime, addRelTime, days, seconds)
+import DA.Assert ((===))
+
+-- | Represents a delegator's request to unbond a certain amount of staked tokens
+-- | from a specific validator's pool. This contract enforces the unbonding cooldown
+-- | period before the funds can be withdrawn by the delegator.
+-- | The existence of this contract signifies that the tokens are in a locked,
+-- | "unbonding" state.
+template UnbondingEntry
   with
-    operator: Party
-    validator: Party
-    owner: Party
-    amount: Decimal
-  where
-    signatory operator, validator
-    observer owner
-
--- | Represents a delegator's tokens that are in the unbonding (cooldown) period.
--- After the `releaseTime` has passed, the delegator can withdraw the funds.
--- This contract is created by the `Pool` contract when a delegator initiates
--- an unbonding request.
-template Unbonding
-  with
-    operator: Party
-      -- ^ The main operator of the staking protocol.
-    validator: Party
-      -- ^ The validator of the pool from which tokens are being unbonded.
     delegator: Party
-      -- ^ The owner of the tokens being unbonded.
+      -- ^ The party who initiated the unbonding request and will receive the funds.
+    validatorOperator: Party
+      -- ^ The operator of the staking pool from which the funds are being unbonded.
     poolId: Text
-      -- ^ The unique identifier of the staking pool.
+      -- ^ Unique identifier for the staking pool.
     amount: Decimal
-      -- ^ The amount of tokens in the unbonding queue.
-    releaseTime: Time
-      -- ^ The timestamp after which the tokens can be withdrawn.
+      -- ^ The quantity of tokens being unbonded.
+    initiationTime: Time
+      -- ^ The timestamp when the unbonding process was initiated.
+    completionTime: Time
+      -- ^ The timestamp after which the unbonded tokens can be withdrawn.
   where
-    signatory operator, validator
-    observer delegator
+    signatory delegator, validatorOperator
 
-    key (operator, validator, delegator, poolId, releaseTime) : (Party, Party, Party, Text, Time)
-    maintainer key._1, key._2
+    key (delegator, validatorOperator, poolId, initiationTime) : (Party, Party, Text, Time)
+    maintainer key._1
 
-    choice WithdrawUnbonded : ContractId WithdrawnFunds
-      -- | Allows the delegator to claim their tokens after the unbonding
-      -- | period has concluded. This action archives the `Unbonding` contract
-      -- | and creates a `WithdrawnFunds` contract representing the liquid assets.
+    -- | Allows the delegator to withdraw their unbonded tokens after the cooldown
+    -- | period has elapsed. This choice archives the entry, signifying the completion
+    -- | of the unbonding lifecycle. The calling context (e.g., a StakingPool choice)
+    -- | is responsible for orchestrating the actual token transfer.
+    choice Withdraw : Decimal
       controller delegator
       do
-        now <- getTime
-        assert (now >= releaseTime)
-          $ "Withdrawal attempt failed: unbonding period has not yet elapsed. "
-          <> "Available for withdrawal after " <> show releaseTime <> "."
+        currentTime <- getTime
+        assertMsg
+          ("Unbonding cooldown period has not yet elapsed. " <>
+           "Funds can be withdrawn after " <> show completionTime <>
+           ", but current time is " <> show currentTime <> ".")
+          (currentTime >= completionTime)
 
-        -- In a real implementation, this might trigger a more complex settlement
-        -- process or create a fungible token contract. For this protocol, we
-        -- create a simple `WithdrawnFunds` contract to represent the released assets.
-        create WithdrawnFunds with
-          operator
-          validator
-          owner = delegator
-          amount
+        -- This choice simply confirms withdrawal eligibility and returns the amount.
+        -- The actual token transfer is expected to be handled in the calling choice
+        -- that exercises this one.
+        return amount
+
+-- | Helper function to create an UnbondingEntry on the ledger.
+-- | This encapsulates the logic for calculating the completion time based on a
+-- | given cooldown period.
+createUnbondingEntry : Party -> Party -> Text -> Decimal -> RelTime -> Update (ContractId UnbondingEntry)
+createUnbondingEntry delegator validatorOperator poolId amount cooldownPeriod = do
+  initiationTime <- getTime
+  let completionTime = addRelTime initiationTime cooldownPeriod
+  create UnbondingEntry with ..
+
+-- =============================================================================
+-- | TEST SUITE
+-- =============================================================================
+-- Using Daml Script for testing the unbonding logic.
+
+setupParties : Script (Party, Party)
+setupParties = script do
+  delegator <- allocatePartyWithHint "Delegator" (PartyIdHint "delegator")
+  validator <- allocatePartyWithHint "Validator" (PartyIdHint "validator")
+  return (delegator, validator)
+
+-- Test a successful withdrawal after the cooldown period has passed.
+test_WithdrawalSucceedsAfterCooldown : Script ()
+test_WithdrawalSucceedsAfterCooldown = script do
+  (delegator, validator) <- setupParties
+  let
+    poolId = "validator-pool-01"
+    unbondingAmount = 1000.0
+    cooldown = days 7
+
+  -- Submit the unbonding request and get the initiation time from the ledger.
+  (entryCid, initiationTime) <- submit delegator do
+    t <- getTime
+    cid <- createUnbondingEntry delegator validator poolId unbondingAmount cooldown
+    return (cid, t)
+
+  -- Advance time to just after the completion time.
+  let completionTime = addRelTime initiationTime cooldown
+  passTime (addRelTime completionTime (seconds 1))
+
+  -- The delegator successfully withdraws the funds.
+  amountWithdrawn <- submit delegator do
+    exercise entryCid Withdraw
+
+  -- Assert the correct amount was returned.
+  amountWithdrawn === unbondingAmount
+  pure ()
+
+
+-- Test that a withdrawal attempt fails if the cooldown period has not elapsed.
+test_WithdrawalFailsBeforeCooldownEnds : Script ()
+test_WithdrawalFailsBeforeCooldownEnds = script do
+  (delegator, validator) <- setupParties
+  let
+    poolId = "validator-pool-02"
+    unbondingAmount = 500.0
+    cooldown = days 14
+
+  -- Submit the unbonding request.
+  entryCid <- submit delegator do
+    createUnbondingEntry delegator validator poolId unbondingAmount cooldown
+
+  -- Advance time by a small amount, but not enough to pass the cooldown.
+  passTime (days 13)
+
+  -- Attempting to withdraw now should fail.
+  result <- submitMustFail delegator do
+    exercise entryCid Withdraw
+
+  -- The `submitMustFail` call confirms the transaction failed as expected due to
+  -- the assertion on `completionTime`.
+  pure ()
+
+-- Test that the validator cannot initiate the withdrawal.
+test_ValidatorCannotWithdraw : Script ()
+test_ValidatorCannotWithdraw = script do
+  (delegator, validator) <- setupParties
+  let
+    poolId = "validator-pool-03"
+    unbondingAmount = 250.0
+    cooldown = days 1
+
+  -- Submit the unbonding request.
+  entryCid <- submit delegator do
+    createUnbondingEntry delegator validator poolId unbondingAmount cooldown
+
+  -- Advance time past the cooldown to ensure failure is due to authorization, not timing.
+  passTime (days 2)
+
+  -- The validator operator, though a signatory, is not a controller of the Withdraw choice.
+  -- This submission must fail.
+  result <- submitMustFail validator do
+    exercise entryCid Withdraw
+
+  pure ()
